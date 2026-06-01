@@ -126,3 +126,52 @@ func TestHandleSend_EmptyProjectMultipleEnginesRequiresName(t *testing.T) {
 		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+type stubMetadataPlatform struct {
+	stubMediaPlatform
+	sessionKey string
+	metadata   map[string]string
+}
+
+func (p *stubMetadataPlatform) StoreProactiveContext(sessionKey string, metadata map[string]string) {
+	p.sessionKey = sessionKey
+	p.metadata = metadata
+}
+
+func TestHandleSend_StoresMetadata(t *testing.T) {
+	platform := &stubMetadataPlatform{stubMediaPlatform: stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}}
+	engine := NewEngine("test", &stubAgent{}, []Platform{platform}, "", LangEnglish)
+	engine.interactiveStates["session-1"] = &interactiveState{
+		platform: platform,
+		replyCtx: "reply-ctx",
+	}
+
+	api := &APIServer{engines: map[string]*Engine{"test": engine}}
+	reqBody := SendRequest{
+		Project:    "test",
+		SessionKey: "session-1",
+		Message:    "delivery ready",
+		Metadata: map[string]string{
+			"workspace_id": "ws-1",
+			"issue_id":     "issue-1",
+		},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/send", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	api.handleSend(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if platform.sessionKey != "session-1" {
+		t.Fatalf("stored session key = %q", platform.sessionKey)
+	}
+	if platform.metadata["workspace_id"] != "ws-1" || platform.metadata["issue_id"] != "issue-1" {
+		t.Fatalf("stored metadata = %#v", platform.metadata)
+	}
+}

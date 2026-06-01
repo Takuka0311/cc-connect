@@ -25,6 +25,14 @@ type ReplyContextReconstructor interface {
 	ReconstructReplyCtx(sessionKey string) (any, error)
 }
 
+// ProactiveContextStorer is an optional interface for platforms that need to
+// remember metadata attached to proactive sends. This lets a later user reply
+// recover structured context even when the messaging platform truncates the
+// quoted message body.
+type ProactiveContextStorer interface {
+	StoreProactiveContext(sessionKey string, metadata map[string]string)
+}
+
 // MessageRecallDetector is an optional interface for platforms that can check
 // whether the message targeted by a reply context was recalled/deleted.
 type MessageRecallDetector interface {
@@ -575,4 +583,13 @@ const (
 // updating the visual status of a preview card header.
 type PreviewStatusUpdater interface {
 	SetPreviewStatus(previewHandle any, status CardStatus)
+}
+
+// DirectNotifier is an optional interface for platforms that can send
+// notifications directly to a user by their platform user ID, without
+// requiring an active session. Metadata is stored alongside the notification
+// so the platform can retrieve it when the user replies (useful when the
+// messaging platform truncates quoted content).
+type DirectNotifier interface {
+	SendNotification(ctx context.Context, userID, title, content string, metadata map[string]string) error
 }

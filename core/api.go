@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,7 +9,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,6 +37,7 @@ type SendRequest struct {
 	Message    string            `json:"message"`
 	Images     []ImageAttachment `json:"images,omitempty"`
 	Files      []FileAttachment  `json:"files,omitempty"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
 }
 
 // NewAPIServer creates an API server on a Unix socket.
@@ -71,6 +76,7 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	s.mux.HandleFunc("/relay/send", s.handleRelaySend)
 	s.mux.HandleFunc("/relay/bind", s.handleRelayBind)
 	s.mux.HandleFunc("/relay/binding", s.handleRelayBinding)
+	s.mux.HandleFunc("/notify", s.handleNotify)
 
 	return s, nil
 }
@@ -172,7 +178,7 @@ func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := engine.SendToSessionWithAttachments(req.SessionKey, req.Message, req.Images, req.Files); err != nil {
+	if err := engine.SendToSessionWithMetadata(req.SessionKey, req.Message, req.Images, req.Files, req.Metadata); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -501,4 +507,161 @@ func (s *APIServer) handleRelayBinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apiJSON(w, http.StatusOK, binding)
+}
+
+// ── Notify API ────────────────────────────────────────────────
+
+// NotifyRequest is the JSON body for POST /notify.
+type NotifyRequest struct {
+	Platform string            `json:"platform"`
+	UserID   string            `json:"user_id"`
+	Title    string            `json:"title"`
+	Content  string            `json:"content"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+// aoneIDRegex extracts an Aone work item ID from strings like "[AONE-32274756]".
+var aoneIDRegex = regexp.MustCompile(`\[AONE-(\d+)\]`)
+
+// aoneDedup prevents duplicate Aone comments when the same Multica event fans
+// out to multiple recipients (each recipient triggers a separate /notify call).
+// Key: "workitemID:contentHash", TTL: 30 seconds.
+var aoneDedup = struct {
+	sync.Mutex
+	seen map[string]time.Time
+}{seen: make(map[string]time.Time)}
+
+func aoneDedupKey(workitemID, content string) string {
+	return workitemID + ":" + fmt.Sprintf("%x", len(content))
+}
+
+// pushAoneComment runs `a1 project workitem comment create` in a background
+// goroutine to sync the notification as a comment on the linked Aone work item.
+// Best-effort: failures are logged and swallowed. Deduplicates within a 30s
+// window so fan-out to multiple recipients produces only one Aone comment.
+func pushAoneComment(title, content, notifType string) {
+	m := aoneIDRegex.FindStringSubmatch(title)
+	if m == nil {
+		return
+	}
+	workitemID := m[1]
+	slog.Info("aone: matched AONE ID, will sync comment", "workitem_id", workitemID)
+
+	var b strings.Builder
+	b.WriteString("[Multica] ")
+	if notifType != "" {
+		b.WriteString(notifType)
+		b.WriteString(": ")
+	}
+	b.WriteString(title)
+	if content != "" {
+		b.WriteString("\n\n")
+		b.WriteString(content)
+	}
+	b.WriteString("\n\n---\n> Auto-synced by Multica via cc-connect")
+	comment := b.String()
+
+	// Dedup: skip if we already posted for this workitem+content combo recently.
+	key := aoneDedupKey(workitemID, comment)
+	aoneDedup.Lock()
+	if t, ok := aoneDedup.seen[key]; ok && time.Since(t) < 30*time.Second {
+		aoneDedup.Unlock()
+		return
+	}
+	aoneDedup.seen[key] = time.Now()
+	// Lazy cleanup of expired entries.
+	for k, t := range aoneDedup.seen {
+		if time.Since(t) > 60*time.Second {
+			delete(aoneDedup.seen, k)
+		}
+	}
+	aoneDedup.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "a1", "project", "workitem", "comment", "create", workitemID, "-m", comment)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			slog.Warn("aone: push comment failed",
+				"workitem_id", workitemID,
+				"error", err,
+				"output", string(out))
+			return
+		}
+		slog.Info("aone: comment synced", "workitem_id", workitemID, "notif_type", notifType)
+	}()
+}
+
+func (s *APIServer) handleNotify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req NotifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.UserID == "" || req.Content == "" {
+		http.Error(w, "user_id and content are required", http.StatusBadRequest)
+		return
+	}
+	if req.Platform == "" {
+		req.Platform = "dingtalk"
+	}
+
+	s.mu.RLock()
+	var engine *Engine
+	if len(s.engines) == 1 {
+		for _, e := range s.engines {
+			engine = e
+		}
+	} else {
+		for _, e := range s.engines {
+			engine = e
+			break
+		}
+	}
+	s.mu.RUnlock()
+
+	if engine == nil {
+		http.Error(w, "no engine available", http.StatusServiceUnavailable)
+		return
+	}
+
+	var targetPlatform Platform
+	for _, p := range engine.platforms {
+		if p.Name() == req.Platform {
+			targetPlatform = p
+			break
+		}
+	}
+	if targetPlatform == nil {
+		http.Error(w, fmt.Sprintf("platform %q not found", req.Platform), http.StatusNotFound)
+		return
+	}
+
+	notifier, ok := targetPlatform.(DirectNotifier)
+	if !ok {
+		http.Error(w, fmt.Sprintf("platform %q does not support direct notifications", req.Platform), http.StatusBadRequest)
+		return
+	}
+
+	// Best-effort Aone sync fires before DingTalk delivery — it runs in a
+	// goroutine so it never blocks, and must not depend on DingTalk success
+	// (which can fail due to IP whitelist, token expiry, etc.).
+	pushAoneComment(req.Title, req.Content, req.Metadata["inbox_type"])
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	if err := notifier.SendNotification(ctx, req.UserID, req.Title, req.Content, req.Metadata); err != nil {
+		slog.Warn("notify: send failed", "platform", req.Platform, "user_id", req.UserID, "error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	apiJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

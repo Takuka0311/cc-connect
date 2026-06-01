@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +55,21 @@ type repliedTextContent struct {
 
 const maxQuotedMessageRunes = 4000
 
+type repliedMarkdownContent struct {
+	Title string `json:"title"`
+	Text  string `json:"text"`
+}
+
+type multicaContext struct {
+	WorkspaceID string
+	IssueID     string
+}
+
+type notifyEntry struct {
+	metadata  map[string]string
+	timestamp time.Time
+}
+
 type downloadResponse struct {
 	DownloadUrl string `json:"downloadUrl"`
 }
@@ -79,6 +95,10 @@ type Platform struct {
 	cardThrottleMs  int
 	degradeUntil    time.Time
 	degradeMu       sync.Mutex
+	// Per-user notification context: maps staffId → metadata from SendNotification.
+	// Used to recover context when DingTalk truncates quoted content on reply.
+	notifyCtxMu sync.RWMutex
+	notifyCtx   map[string]notifyEntry
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -290,7 +310,7 @@ func (p *Platform) onMessage(data *chatbot.BotCallbackDataModel, richText *richT
 	messageContent := data.Text.Content
 	if richText != nil && richText.IsReplyMsg && richText.RepliedMsg != nil {
 		slog.Debug("dingtalk: reply message detected", "msgType", richText.RepliedMsg.MsgType)
-		messageContent = p.formatReplyContent(richText, messageContent)
+		messageContent = p.formatReplyContent(richText, messageContent, data.SenderStaffId, data.ConversationId)
 	}
 
 	// Handle text messages (default)
@@ -759,6 +779,8 @@ func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttach
 var _ core.ImageSender = (*Platform)(nil)
 var _ core.StreamingCardPlatform = (*Platform)(nil)
 var _ core.ReplyContextReconstructor = (*Platform)(nil)
+var _ core.DirectNotifier = (*Platform)(nil)
+var _ core.ProactiveContextStorer = (*Platform)(nil)
 
 // CreateStreamingCard creates a new streaming card for the given reply context.
 // Implements core.StreamingCardPlatform.
@@ -1097,25 +1119,107 @@ func (p *Platform) Stop() error {
 	return nil
 }
 
+var (
+	multicaContextRe = regexp.MustCompile(`\[multica:ws=([0-9a-f-]{36}),issue=([0-9a-f-]{36})\]`)
+	uuidRe           = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+)
+
+// parseMulticaContext extracts workspace_id and issue_id from a
+// [multica:ws=<uuid>,issue=<uuid>] marker embedded in text.
+func parseMulticaContext(text string) *multicaContext {
+	m := multicaContextRe.FindStringSubmatch(text)
+	if m == nil {
+		return nil
+	}
+	return &multicaContext{WorkspaceID: m[1], IssueID: m[2]}
+}
+
+func parseMulticaMetadata(meta map[string]string) *multicaContext {
+	wsID := strings.TrimSpace(meta["workspace_id"])
+	issueID := strings.TrimSpace(meta["issue_id"])
+	if !uuidRe.MatchString(wsID) || !uuidRe.MatchString(issueID) {
+		return nil
+	}
+	return &multicaContext{WorkspaceID: wsID, IssueID: issueID}
+}
+
+func groupNotifyContextKey(conversationId string) string {
+	return "group:" + conversationId
+}
+
+// extractQuotedText returns the plain text of a quoted/replied message,
+// supporting both text and markdown (sampleMarkdown) message types.
+func extractQuotedText(replied *repliedMessage) string {
+	if replied == nil {
+		return ""
+	}
+	switch replied.MsgType {
+	case "text":
+		var c repliedTextContent
+		if err := json.Unmarshal(replied.Content, &c); err != nil {
+			slog.Debug("dingtalk: failed to parse replied text content", "error", err)
+			return ""
+		}
+		return c.Text
+	case "sampleMarkdown", "markdown":
+		var c repliedMarkdownContent
+		if err := json.Unmarshal(replied.Content, &c); err != nil {
+			slog.Debug("dingtalk: failed to parse replied markdown content", "error", err)
+			return ""
+		}
+		if strings.TrimSpace(c.Text) == "" || strings.TrimSpace(c.Text) == "#title#" {
+			return c.Title
+		}
+		return c.Text
+	default:
+		slog.Debug("dingtalk: quoted message type not supported", "type", replied.MsgType)
+		return ""
+	}
+}
+
 // formatReplyContent prepends quoted text to the message content when the user
 // replies to / quotes a previous message. richText is parsed from the raw JSON
 // "text" object which the SDK's BotCallbackDataTextModel silently drops.
-func (p *Platform) formatReplyContent(richText *richTextContent, fallback string) string {
+//
+// When the quoted message contains a [multica:...] context marker, the reply
+// is formatted as a structured Multica command context so the AI agent can
+// use multica CLI to interact with the referenced issue. If the marker is
+// missing and DingTalk did not provide any quoted text, falls back to stored
+// notification context for the sender in direct chats. Group chats intentionally
+// do not use the latest stored context: without a marker in the quoted message,
+// the cache can point at the newest issue instead of the message the user quoted.
+func (p *Platform) formatReplyContent(richText *richTextContent, fallback string, senderStaffId string, conversationIds ...string) string {
 	content := richText.Content
 	if content == "" {
 		content = fallback
 	}
 
-	if richText.RepliedMsg == nil {
-		return content
-	}
-
 	quotedText := p.extractQuotedMessageText(richText.RepliedMsg)
 	if quotedText == "" {
+		quotedText = extractQuotedText(richText.RepliedMsg)
+	}
+
+	if mctx := parseMulticaContext(quotedText); mctx != nil {
+		return formatMulticaReply(mctx, content)
+	}
+	if quotedText != "" {
+		return fmt.Sprintf("引用: \"%s\"\n\n%s", quotedText, content)
+	}
+
+	if len(conversationIds) > 0 && conversationIds[0] != "" {
 		return content
 	}
 
-	return fmt.Sprintf("引用: \"%s\"\n\n%s", quotedText, content)
+	// DingTalk sometimes omits quoted content for bot-sent sampleMarkdown
+	// messages in direct chats. Fall back to stored notification context only
+	// when there is no quoted text to correlate.
+	if meta, ok := p.getNotifyContext(senderStaffId); ok {
+		if mctx := parseMulticaMetadata(meta); mctx != nil {
+			return formatMulticaReply(mctx, content)
+		}
+	}
+
+	return content
 }
 
 func (p *Platform) extractQuotedMessageText(msg *repliedMessage) string {
@@ -1280,6 +1384,24 @@ func normalizeQuotedMessageText(s string) string {
 	return string(runes[:maxQuotedMessageRunes]) + "..."
 }
 
+func formatMulticaReply(mctx *multicaContext, userMessage string) string {
+	return fmt.Sprintf(
+		"[multica-reply workspace_id=%s issue_id=%s]\n"+
+			"The user is replying to a Multica issue notification. "+
+			"Use `multica` CLI to handle this reply.\n"+
+			"Example commands:\n"+
+			"  MULTICA_WORKSPACE_ID=%s multica issue comment add %s --content \"...\"\n"+
+			"  MULTICA_WORKSPACE_ID=%s multica issue update %s --status <status>\n"+
+			"  MULTICA_WORKSPACE_ID=%s multica issue get %s\n\n"+
+			"User's message: %s",
+		mctx.WorkspaceID, mctx.IssueID,
+		mctx.WorkspaceID, mctx.IssueID,
+		mctx.WorkspaceID, mctx.IssueID,
+		mctx.WorkspaceID, mctx.IssueID,
+		userMessage,
+	)
+}
+
 // ReconstructReplyCtx implements core.ReplyContextReconstructor.
 // Session key format: "dingtalk:{convType}:{conversationId}:{senderStaffId}" or "dingtalk:{convType}:{conversationId}"
 // where convType is "g" (group) or "d" (direct/1:1).
@@ -1318,6 +1440,31 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	}, nil
 }
 
+func (p *Platform) StoreProactiveContext(sessionKey string, metadata map[string]string) {
+	if parseMulticaMetadata(metadata) == nil {
+		return
+	}
+	if idx := strings.Index(sessionKey, "dingtalk:"); idx > 0 {
+		sessionKey = sessionKey[idx:]
+	}
+	rctx, err := p.ReconstructReplyCtx(sessionKey)
+	if err != nil {
+		slog.Debug("dingtalk: skip proactive context for invalid session key", "session_key", sessionKey, "error", err)
+		return
+	}
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return
+	}
+	if rc.isGroup && rc.conversationId != "" {
+		p.storeNotifyContext(groupNotifyContextKey(rc.conversationId), metadata)
+		return
+	}
+	if rc.senderStaffId != "" {
+		p.storeNotifyContext(rc.senderStaffId, metadata)
+	}
+}
+
 // sendProactiveMessage sends a message using the DingTalk group/direct message API
 // instead of the temporary sessionWebhook. This enables cc-connect send, cron,
 // webhook, and other proactive messaging features.
@@ -1327,6 +1474,7 @@ func (p *Platform) sendProactiveMessage(ctx context.Context, rc replyContext, co
 		return fmt.Errorf("dingtalk: get access token for proactive send: %w", err)
 	}
 
+	title := dingtalkMarkdownTitle(content)
 	content = preprocessDingTalkMarkdown(content)
 
 	var apiURL string
@@ -1335,7 +1483,7 @@ func (p *Platform) sendProactiveMessage(ctx context.Context, rc replyContext, co
 	if rc.isGroup && rc.conversationId != "" {
 		// Group message via /v1.0/robot/groupMessages/send
 		apiURL = "https://api.dingtalk.com/v1.0/robot/groupMessages/send"
-		msgParam, _ := json.Marshal(map[string]string{"text": content})
+		msgParam, _ := json.Marshal(map[string]string{"title": title, "text": content})
 		requestBody = map[string]any{
 			"robotCode":          p.robotCode,
 			"openConversationId": rc.conversationId,
@@ -1345,7 +1493,7 @@ func (p *Platform) sendProactiveMessage(ctx context.Context, rc replyContext, co
 	} else if rc.senderStaffId != "" {
 		// Direct message via /v1.0/robot/oToMessages/batchSend
 		apiURL = "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
-		msgParam, _ := json.Marshal(map[string]string{"title": "reply", "text": content})
+		msgParam, _ := json.Marshal(map[string]string{"title": title, "text": content})
 		requestBody = map[string]any{
 			"robotCode": p.robotCode,
 			"userIds":   []string{rc.senderStaffId},
@@ -1383,6 +1531,83 @@ func (p *Platform) sendProactiveMessage(ctx context.Context, rc replyContext, co
 	return nil
 }
 
+// SendNotification sends a sampleMarkdown OTO message to a user and stores
+// the metadata so it can be recovered when the user replies.
+// Implements core.DirectNotifier.
+func (p *Platform) SendNotification(ctx context.Context, userID, title, content string, metadata map[string]string) error {
+	token, err := p.getAccessToken()
+	if err != nil {
+		return fmt.Errorf("dingtalk: get access token: %w", err)
+	}
+
+	msgParam, _ := json.Marshal(map[string]string{"title": title, "text": content})
+	requestBody := map[string]any{
+		"robotCode": p.robotCode,
+		"userIds":   []string{userID},
+		"msgKey":    "sampleMarkdown",
+		"msgParam":  string(msgParam),
+	}
+
+	body, err := json.Marshal(requestBody)
+	if err != nil {
+		return fmt.Errorf("dingtalk: marshal notification: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+		bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("dingtalk: create notification request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-acs-dingtalk-access-token", token)
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("dingtalk: notification request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("dingtalk: notification failed: status=%d, body=%s", resp.StatusCode, string(respBody))
+	}
+
+	if len(metadata) > 0 {
+		p.storeNotifyContext(userID, metadata)
+	}
+
+	slog.Debug("dingtalk: notification sent", "user_id", userID, "title", title)
+	return nil
+}
+
+func (p *Platform) storeNotifyContext(userID string, metadata map[string]string) {
+	p.notifyCtxMu.Lock()
+	defer p.notifyCtxMu.Unlock()
+	if p.notifyCtx == nil {
+		p.notifyCtx = make(map[string]notifyEntry)
+	}
+	meta := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		meta[k] = v
+	}
+	p.notifyCtx[userID] = notifyEntry{metadata: meta, timestamp: time.Now()}
+}
+
+func (p *Platform) getNotifyContext(userID string) (map[string]string, bool) {
+	p.notifyCtxMu.RLock()
+	defer p.notifyCtxMu.RUnlock()
+	entry, ok := p.notifyCtx[userID]
+	if !ok {
+		return nil, false
+	}
+	// Expire after 24 hours
+	if time.Since(entry.timestamp) > 24*time.Hour {
+		return nil, false
+	}
+	return entry.metadata, true
+}
+
 // preprocessDingTalkMarkdown adapts content for DingTalk's markdown renderer:
 //   - Leading spaces → non-breaking spaces (prevents markdown from stripping indentation)
 //   - Single \n between non-empty lines → trailing two-space forced line break
@@ -1417,4 +1642,36 @@ func preprocessDingTalkMarkdown(s string) string {
 		}
 	}
 	return sb.String()
+}
+
+func dingtalkMarkdownTitle(content string) string {
+	marker := ""
+	if m := multicaContextRe.FindString(content); m != "" {
+		marker = m
+	}
+
+	humanTitle := ""
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || line == marker {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimLeft(line, "#"))
+		line = strings.TrimSpace(strings.TrimPrefix(line, ">"))
+		if line != "" {
+			humanTitle = line
+			break
+		}
+	}
+
+	switch {
+	case marker != "" && humanTitle != "":
+		return marker + " " + humanTitle
+	case marker != "":
+		return marker
+	case humanTitle != "":
+		return humanTitle
+	default:
+		return "cc-connect"
+	}
 }
