@@ -269,7 +269,7 @@ type Engine struct {
 	replyFooterUsage    replyFooterUsageCache
 
 	// /web command callbacks
-	webSetupFunc  func() (port int, token string, needRestart bool, err error)
+	webSetupFunc  func() (url string, token string, needRestart bool, err error)
 	webStatusFunc func() (url string)
 
 	// Data directory for socket path injection
@@ -623,13 +623,12 @@ func (e *Engine) SetFilterExternalSessions(v bool) {
 	e.filterExternalSessions = v
 }
 
-func (e *Engine) SetWebSetupFunc(fn func() (int, string, bool, error)) { e.webSetupFunc = fn }
-func (e *Engine) SetWebStatusFunc(fn func() string)                    { e.webStatusFunc = fn }
+func (e *Engine) SetWebSetupFunc(fn func() (string, string, bool, error)) { e.webSetupFunc = fn }
+func (e *Engine) SetWebStatusFunc(fn func() string)                       { e.webStatusFunc = fn }
 
 func (e *Engine) SetSkipGit(skipGit bool) {
 	e.skipGit = skipGit
 }
-
 
 // SetInjectSender controls whether sender identity (platform and user ID) is
 // prepended to each message before forwarding it to the agent. When enabled,
@@ -3631,7 +3630,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.markStopped()
 			gracePeriod := 10 * time.Second
 			graceTimer := time.NewTimer(gracePeriod)
-			graceLoop:
+		graceLoop:
 			for {
 				select {
 				case evt, ok := <-state.agentSession.Events():
@@ -13979,12 +13978,11 @@ func (e *Engine) cmdWebSetup(p Platform, msg *Message) {
 		return
 	}
 
-	port, token, needRestart, err := e.webSetupFunc()
+	url, token, needRestart, err := e.webSetupFunc()
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
 		return
 	}
-	url := fmt.Sprintf("http://localhost:%d", port)
 	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgWebSetupSuccess), url, token))
 	if needRestart {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgWebNeedRestart))

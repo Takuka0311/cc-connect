@@ -14,16 +14,19 @@ import SkillList from '@/pages/Skills/SkillList';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  const checking = useAuthStore((s) => s.checking);
+  if (checking) return null;
   if (!isAuthenticated) return <Navigate to="/login" replace />;
   return <>{children}</>;
 }
 
 export default function App() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  const checking = useAuthStore((s) => s.checking);
 
   return (
     <Routes>
-      <Route path="/login" element={isAuthenticated ? <Navigate to="/" replace /> : <Login />} />
+      <Route path="/login" element={checking ? null : isAuthenticated ? <Navigate to="/" replace /> : <Login />} />
       <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
         <Route index element={<Dashboard />} />
         <Route path="projects" element={<ProjectList />} />

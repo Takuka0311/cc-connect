@@ -758,14 +758,15 @@ func main() {
 		})
 
 		// Wire /web command callbacks
-		engine.SetWebSetupFunc(func() (int, string, bool, error) {
+		engine.SetWebSetupFunc(func() (string, string, bool, error) {
 			mgmtToken := core.GenerateToken(16)
 			bridgeToken := core.GenerateToken(16)
 			result, err := config.EnableWebAdmin(mgmtToken, bridgeToken)
 			if err != nil {
-				return 0, "", false, err
+				return "", "", false, err
 			}
-			return result.ManagementPort, result.ManagementToken, !result.AlreadyEnabled, nil
+			url := fmt.Sprintf("http://%s:%d", core.DisplayHost(cfg.Management.Host), result.ManagementPort)
+			return url, result.ManagementToken, !result.AlreadyEnabled, nil
 		})
 		engine.SetWebStatusFunc(func() string {
 			if cfg.Management.Enabled == nil || !*cfg.Management.Enabled {
@@ -775,7 +776,7 @@ func main() {
 			if port == 0 {
 				port = 9820
 			}
-			return fmt.Sprintf("http://localhost:%d", port)
+			return fmt.Sprintf("http://%s:%d", core.DisplayHost(cfg.Management.Host), port)
 		})
 
 		engines = append(engines, engine)
@@ -889,6 +890,7 @@ func main() {
 			port = 9820
 		}
 		mgmtSrv = core.NewManagementServer(port, cfg.Management.Token, cfg.Management.CORSOrigins)
+		mgmtSrv.SetHost(cfg.Management.Host)
 		for i, e := range engines {
 			mgmtSrv.RegisterEngine(cfg.Projects[i].Name, e)
 		}

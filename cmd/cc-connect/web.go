@@ -49,7 +49,7 @@ func runWeb(args []string) {
 		fmt.Println("Restart cc-connect for the changes to take effect.")
 	}
 
-	baseURL := fmt.Sprintf("http://localhost:%d", port)
+	baseURL := fmt.Sprintf("http://%s:%d", core.DisplayHost(cfg.Management.Host), port)
 
 	noBrowser := false
 	for _, a := range args {

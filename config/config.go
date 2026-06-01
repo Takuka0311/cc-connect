@@ -110,8 +110,8 @@ type Config struct {
 	Bridge             BridgeConfig            `toml:"bridge"`
 	Management         ManagementConfig        `toml:"management"`
 	Hooks              []HookConfig            `toml:"hooks"`
-	IdleTimeoutMins    *int                    `toml:"idle_timeout_mins,omitempty"`    // max minutes between consecutive agent events; 0 = no timeout; default 120
-	MaxTurnTimeMins    *int                    `toml:"max_turn_time_mins,omitempty"`   // absolute wall-clock cap per turn in minutes; 0 = disabled (default)
+	IdleTimeoutMins    *int                    `toml:"idle_timeout_mins,omitempty"`  // max minutes between consecutive agent events; 0 = no timeout; default 120
+	MaxTurnTimeMins    *int                    `toml:"max_turn_time_mins,omitempty"` // absolute wall-clock cap per turn in minutes; 0 = disabled (default)
 	// WorkspaceIdleTimeoutMins controls the workspace idle reaper timeout
 	// (multi-workspace mode) for every engine in the process. 0 disables
 	// reaping. Default: 15 minutes. Defined as a top-level (process-global)
@@ -162,6 +162,7 @@ type HookConfig struct {
 // ManagementConfig controls the HTTP Management API for external tools.
 type ManagementConfig struct {
 	Enabled     *bool    `toml:"enabled"`                // default false
+	Host        string   `toml:"host,omitempty"`         // bind address; empty = all interfaces (0.0.0.0), e.g. "0.0.0.0" for external access, "127.0.0.1" for local only
 	Port        int      `toml:"port,omitempty"`         // listen port; default 9820
 	Token       string   `toml:"token,omitempty"`        // shared secret for authentication; required
 	CORSOrigins []string `toml:"cors_origins,omitempty"` // allowed CORS origins; empty = no CORS
@@ -176,14 +177,14 @@ const (
 
 // DisplayConfig controls how intermediate messages (thinking, tool output) are shown.
 type DisplayConfig struct {
-	Mode               *string `toml:"mode"`                 // "full" (default), "compact", or "quiet"
-	CardMode           *string `toml:"card_mode"`            // "legacy" (default) or "rich" (Card 2.0 Feishu)
-	ThinkingMessages   *bool   `toml:"thinking_messages"`    // whether thinking messages are shown; default true
-	ThinkingMaxLen     *int    `toml:"thinking_max_len"`     // max chars for thinking messages; 0 = no truncation; default 300
-	ToolMaxLen         *int    `toml:"tool_max_len"`         // max chars for tool use messages; 0 = no truncation; default 500
-	ToolMessages       *bool   `toml:"tool_messages"`        // whether tool progress messages are shown; default true
-	ShowContextIndicator *bool `toml:"show_context_indicator"` // whether [ctx: ~N%] suffix is shown; default true
-	ReplyFooter        *bool   `toml:"reply_footer"`         // whether Codex-like footer is shown; default true
+	Mode                 *string `toml:"mode"`                   // "full" (default), "compact", or "quiet"
+	CardMode             *string `toml:"card_mode"`              // "legacy" (default) or "rich" (Card 2.0 Feishu)
+	ThinkingMessages     *bool   `toml:"thinking_messages"`      // whether thinking messages are shown; default true
+	ThinkingMaxLen       *int    `toml:"thinking_max_len"`       // max chars for thinking messages; 0 = no truncation; default 300
+	ToolMaxLen           *int    `toml:"tool_max_len"`           // max chars for tool use messages; 0 = no truncation; default 500
+	ToolMessages         *bool   `toml:"tool_messages"`          // whether tool progress messages are shown; default true
+	ShowContextIndicator *bool   `toml:"show_context_indicator"` // whether [ctx: ~N%] suffix is shown; default true
+	ReplyFooter          *bool   `toml:"reply_footer"`           // whether Codex-like footer is shown; default true
 }
 
 // StreamPreviewConfig controls real-time streaming preview in IM.

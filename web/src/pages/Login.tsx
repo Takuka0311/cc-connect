@@ -22,7 +22,6 @@ export default function Login() {
   const loginStore = useAuthStore((s) => s.login);
   const { theme, setTheme } = useThemeStore();
   const [token, setToken] = useState('');
-  const [serverUrl, setServerUrl] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const autoLoginAttempted = useRef(false);
@@ -58,7 +57,7 @@ export default function Login() {
     try {
       api.setToken(token.trim());
       await getStatus();
-      loginStore(token.trim(), serverUrl.trim());
+      loginStore(token.trim());
       navigate('/');
     } catch {
       setError(t('login.invalidToken'));
@@ -128,18 +127,6 @@ export default function Login() {
                 placeholder="mgmt-secret-xxx"
                 className="w-full px-4 py-2.5 text-sm rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors placeholder:text-gray-400"
                 autoFocus
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                {t('login.serverUrl')} <span className="text-gray-400 font-normal">({t('common.optional')})</span>
-              </label>
-              <input
-                type="text"
-                value={serverUrl}
-                onChange={(e) => setServerUrl(e.target.value)}
-                placeholder="http://localhost:9820"
-                className="w-full px-4 py-2.5 text-sm rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors placeholder:text-gray-400"
               />
             </div>
             <button
