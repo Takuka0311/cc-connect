@@ -48,8 +48,12 @@ export const platformMeta: Record<string, PlatformMeta> = {
     fields: [
       { key: 'client_id', labelKey: 'fields.clientId', required: true },
       { key: 'client_secret', labelKey: 'fields.clientSecret', required: true, type: 'password' },
+      { key: 'robot_code', labelKey: 'fields.robotCode', group: 'advanced', hintKey: 'fields.robotCodeHint' },
       { key: 'allow_from', labelKey: 'fields.allowFrom', placeholder: '* (all)', group: 'advanced' },
       { key: 'share_session_in_channel', labelKey: 'fields.sharedGroupSession', type: 'boolean', group: 'advanced' },
+      { key: 'card_template_id', labelKey: 'fields.cardTemplateId', group: 'advanced', hintKey: 'fields.cardTemplateIdHint' },
+      { key: 'card_template_key', labelKey: 'fields.cardTemplateKey', placeholder: 'content', group: 'advanced' },
+      { key: 'card_throttle_ms', labelKey: 'fields.cardThrottleMs', type: 'number', placeholder: '300', group: 'advanced' },
     ],
   },
   wecom: {

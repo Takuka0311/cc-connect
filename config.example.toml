@@ -981,6 +981,11 @@ app_secret = "your-feishu-app-secret"
 #    在"应用功能 > 机器人"中启用机器人并选择 Stream 模式
 # 3. Fill in client_id (AppKey) and client_secret (AppSecret) below
 #    填入下方 client_id (AppKey) 和 client_secret (AppSecret)
+# 4. (Optional) AI Card streaming: create an AI card template on the
+#    DingTalk Card Platform (卡片平台) and fill in card_template_id below.
+#    Without card_template_id the bot replies with plain Markdown messages.
+#    (可选) AI 卡片流式输出：在钉钉卡片平台创建 AI 卡片模板后填入 card_template_id，
+#    未配置时机器人将退回到普通 Markdown 消息。
 
 # [[projects.platforms]]
 # type = "dingtalk"
@@ -988,8 +993,13 @@ app_secret = "your-feishu-app-secret"
 # [projects.platforms.options]
 # client_id = "your-dingtalk-client-id"
 # client_secret = "your-dingtalk-client-secret"
+# robot_code = "your-robot-code"  # Defaults to client_id if omitted / 不填则默认使用 client_id
 # allow_from = "*"  # Allowed staff IDs / 允许的员工 ID
 # share_session_in_channel = false  # If true, all users in a group share one agent session / 群聊共享会话
+# # --- AI Card (optional) / AI 卡片（可选）---
+# card_template_id = "your-card-template-id"  # AI card template ID from the DingTalk Card Platform / 钉钉卡片平台的 AI 卡片模板 ID
+# card_template_key = "content"  # Template variable name for the streamed content / 承载流式内容的模板变量名，默认 content
+# card_throttle_ms = 300  # Min interval between streaming updates in ms / 流式更新最小间隔（毫秒），默认 300
 
 # WPS Xiezuo / WPS 协作 (uncomment to enable / 取消注释以启用)
 # 1. Create a WPS Open Platform app and enable event WebSocket delivery

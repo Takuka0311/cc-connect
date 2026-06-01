@@ -255,7 +255,13 @@
     "appSecret": "App Secret",
     "sandboxMode": "Modo sandbox",
     "channelSecret": "Channel Secret",
-    "channelToken": "Channel Access Token"
+    "channelToken": "Channel Access Token",
+    "robotCode": "Código del Robot",
+    "robotCodeHint": "Usa el Client ID si se deja vacío",
+    "cardTemplateId": "ID de plantilla de tarjeta IA",
+    "cardTemplateIdHint": "ID de plantilla de tarjeta IA de la plataforma de tarjetas de DingTalk; habilita las tarjetas en streaming",
+    "cardTemplateKey": "Variable de contenido de la tarjeta",
+    "cardThrottleMs": "Intervalo de actualización de tarjeta (ms)"
   },
   "chat": {
     "noChats": "No hay proyectos",

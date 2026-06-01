@@ -255,7 +255,13 @@
     "appSecret": "App Secret",
     "sandboxMode": "Sandbox mode",
     "channelSecret": "Channel Secret",
-    "channelToken": "Channel Access Token"
+    "channelToken": "Channel Access Token",
+    "robotCode": "Robot Code",
+    "robotCodeHint": "Defaults to Client ID if left empty",
+    "cardTemplateId": "AI Card Template ID",
+    "cardTemplateIdHint": "AI card template ID from the DingTalk Card Platform; enables streaming cards",
+    "cardTemplateKey": "Card Content Variable",
+    "cardThrottleMs": "Card Update Interval (ms)"
   },
   "chat": {
     "noChats": "No projects yet",

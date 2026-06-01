@@ -255,7 +255,13 @@
     "appSecret": "App Secret",
     "sandboxMode": "沙箱模式",
     "channelSecret": "Channel Secret",
-    "channelToken": "Channel Access Token"
+    "channelToken": "Channel Access Token",
+    "robotCode": "机器人 Code",
+    "robotCodeHint": "不填则默认使用 Client ID",
+    "cardTemplateId": "AI 卡片模板 ID",
+    "cardTemplateIdHint": "钉钉卡片平台的 AI 卡片模板 ID，配置后启用流式卡片输出",
+    "cardTemplateKey": "卡片内容变量名",
+    "cardThrottleMs": "卡片更新间隔 (毫秒)"
   },
   "chat": {
     "noChats": "暂无项目",

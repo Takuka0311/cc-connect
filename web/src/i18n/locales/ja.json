@@ -255,7 +255,13 @@
     "appSecret": "アプリシークレット",
     "sandboxMode": "サンドボックスモード",
     "channelSecret": "チャンネルシークレット",
-    "channelToken": "チャンネルアクセストークン"
+    "channelToken": "チャンネルアクセストークン",
+    "robotCode": "ロボットコード",
+    "robotCodeHint": "未入力の場合は Client ID を使用します",
+    "cardTemplateId": "AI カードテンプレート ID",
+    "cardTemplateIdHint": "DingTalk カードプラットフォームの AI カードテンプレート ID。設定するとストリーミングカードが有効になります",
+    "cardTemplateKey": "カード内容の変数名",
+    "cardThrottleMs": "カード更新間隔 (ミリ秒)"
   },
   "chat": {
     "noChats": "プロジェクトがありません",
