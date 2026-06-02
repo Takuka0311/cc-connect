@@ -7,29 +7,54 @@ description: Build, run, stop, and debug the cc-connect Go binary locally. Use w
 
 Project-specific commands for developing and debugging cc-connect. All commands run from the repo root (`/apsara/workspace/cc-connect`). Go 1.25+ and Node (for the web UI) required.
 
+## ⚠️ Always build WITH web / 必须带 Web 启动
+
+**Default rule for any build that will be run or restarted (including cron jobs, sync-and-restart, and local dev): use `make build`, never `make build-noweb` or `-tags no_web`.**
+
+| Command | Web UI at `:9820` | When to use |
+|---------|-------------------|-------------|
+| `make build` | ✅ embedded | **Default** — any binary you start/restart |
+| `make build-noweb` / `-tags no_web` | ❌ 404 on `/` | CI/size-only; **never** for running instances |
+| `go build ./...` | — | Compile check only; does not produce a runnable binary with web |
+
+A `no_web` binary still serves Management **API** (`/api/v1/*`) but **not** the dashboard — `curl http://<host>:9820/` returns **404** instead of **200**.
+
+**Standard deploy pipeline (sync, rebuild, restart):**
+
+```bash
+cd /apsara/workspace/cc-connect
+make build                    # npm run build + go embed web/dist
+scripts/ccctl.sh restart      # detached restart; do NOT kill from inside cc-connect
+```
+
+**Verify web is embedded after build/restart:**
+
+```bash
+go version -m ./cc-connect | grep tags          # must NOT contain no_web
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:9820/   # expect 200
+```
+
 ## Build / 编译
 
 ```bash
-# Full build: builds web frontend (web/ via npm) + Go binary -> ./cc-connect
+# Full build (REQUIRED for running instances): web frontend + Go binary -> ./cc-connect
 make build
 
-# Backend only, skip web frontend (faster; embeds a stub web)
+# Backend only — NO web UI. Do not use for ccctl start/restart or cron deploys.
 make build-noweb
 
 # Quick compile check of all Go packages (no binary, no web)
 go build ./...
-
-# Binary only, without rebuilding the web frontend
-go build -ldflags "-s -w" -o cc-connect ./cmd/cc-connect
 ```
 
-Selective compilation via build tags (default = all agents + platforms):
+Selective compilation via build tags (default = all agents + platforms). **Do not add `no_web` unless explicitly asked for a headless-only binary:**
 
 ```bash
 make build AGENTS=claudecode PLATFORMS_INCLUDE=feishu,telegram
 make build EXCLUDE=discord,dingtalk,qq,qqbot,line
-go build -tags 'no_discord no_qq' -o cc-connect ./cmd/cc-connect
 ```
+
+After Go-only edits (no web/ changes), you may skip `npm run build` but still need a web-enabled binary — use `make build`, not bare `go build -o cc-connect ./cmd/cc-connect` (that reuses existing `web/dist/` but is easy to get wrong; prefer `make build`).
 
 After Go edits, always run `go build ./...`, `gofmt -l <files>`, and `go vet ./...`.
 
@@ -66,7 +91,7 @@ that should outlive the shell.
 ```bash
 ./cc-connect                            # config: --config > ./config.toml > ~/.cc-connect/config.toml
 ./cc-connect --config /path/to/config.toml
-make run                                # build + run in foreground
+make run                                # make build + run in foreground (includes web)
 ```
 
 > ⚠️ **It is a long-running process — it never exits on its own.** If you do run
@@ -79,14 +104,20 @@ make run                                # build + run in foreground
 
 **The running process does NOT hot-reload `config.toml`, and a rebuilt binary
 is not picked up by the already-running process.** After editing config or
-`make build`, you must **restart**:
+rebuilding, you must **restart**:
 
 ```bash
+make build                  # if binary changed — always with web
 scripts/ccctl.sh restart
 ```
 
 This gracefully stops the old instance (SIGTERM, releasing the lock), then
 starts a fresh detached one and waits for the `cc-connect is running` log line.
+
+**Cron / agent tasks:** never restart cc-connect by killing the process from
+inside cc-connect (the agent session dies with the parent). Use
+`scripts/ccctl.sh restart` from a subprocess that survives shutdown, or run
+the script from outside cc-connect entirely.
 
 Manual fallback (if not using the script): the live PID is in the lock file, so
 `kill "$(cat ~/.cc-connect/.config.toml.lock)"`, wait until the process is gone,
@@ -97,6 +128,16 @@ right after killing.
 ### First run / config
 
 First run with no config creates a default at `~/.cc-connect/config.toml` and exits with "Please edit this file...". Fill in real agent/platform credentials, then run again. An instance lock (`~/.cc-connect/.config.toml.lock`) prevents duplicate processes for the same config; a stale lock whose PID is dead is treated as stale and auto-acquired on next start.
+
+Ensure `[management] enabled = true` for the web dashboard. Example:
+
+```toml
+[management]
+  enabled = true
+  host = "0.0.0.0"
+  port = 9820
+  token = "your-mgmt-secret"
+```
 
 ## Stop / 停止
 
@@ -124,23 +165,16 @@ Enable + open the web admin:
 ./cc-connect web --no-browser    # just print URL + token
 ```
 
-The management server binds to `host:port`; `host` defaults to all interfaces (`0.0.0.0`), so it is externally reachable. To restrict or be explicit, set it in `[management]`:
-
-```toml
-[management]
-  enabled = true
-  host = "0.0.0.0"   # all interfaces (external); use "127.0.0.1" for local-only
-  port = 9820
-  token = "your-mgmt-secret"
-```
+The management server binds to `host:port`; `host` defaults to all interfaces (`0.0.0.0`), so it is externally reachable.
 
 Displayed/pushed login URLs use the configured `host`, or auto-detect the machine's outbound LAN IP when `host` is empty/`0.0.0.0` (falls back to `localhost`). Access externally via `http://<server-ip>:9820/login?token=<token>`. If external access fails despite the server listening on `0.0.0.0`, open the port in the firewall / cloud security group — that is not a code issue.
 
-Verify reachability:
+Verify reachability **and** that web assets are embedded:
 
 ```bash
 ss -tlnp | grep -E '9820|9810'
-curl -s -o /dev/null -w "%{http_code}\n" http://<server-ip>:9820/
+curl -s -o /dev/null -w "%{http_code}\n" http://<server-ip>:9820/    # 200 = OK, 404 = no_web binary
+go version -m ./cc-connect | grep tags                                 # must not show no_web
 ```
 
 ## Tests / 测试
