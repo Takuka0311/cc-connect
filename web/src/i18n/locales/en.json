@@ -262,6 +262,12 @@
     "robotCodeHint": "Defaults to Client ID if left empty",
     "cardTemplateId": "AI Card Template ID",
     "cardTemplateIdHint": "AI card template ID from the DingTalk Card Platform; enables streaming cards",
+    "reactionEmoji": "Reaction emoji",
+    "reactionEmojiHint": "Emoji reaction on incoming messages; set to \"none\" to disable",
+    "doneEmoji": "Done emoji",
+    "doneEmojiHint": "Emoji reaction when agent finishes; set to \"none\" to disable",
+    "sessionScope": "Session scope",
+    "sessionScopeHint": "Session isolation: user (default), channel, or thread",
     "cardTemplateKey": "Card Content Variable",
     "cardThrottleMs": "Card Update Interval (ms)"
   },
@@ -339,7 +345,10 @@
     "rlWindowSecs": "Window (sec)",
     "rlWindowSecsHint": "Time window in seconds",
     "log": "Log",
-    "logLevel": "Log level"
+    "logLevel": "Log level",
+    "relay": "Relay",
+    "relayVisibility": "Relay visibility",
+    "relayVisibilityHint": "Controls visibility of relay messages in group chat: full, summary, or none"
   },
   "globalProviders": {
     "title": "Providers",

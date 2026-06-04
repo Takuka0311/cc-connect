@@ -2876,6 +2876,7 @@ type ProjectSettingsUpdate struct {
 	ReplyFooter          *bool
 	InjectSender         *bool
 	PlatformAllowFrom    map[string]string
+	PlatformOptions      map[string]map[string]string
 }
 
 // SaveProjectSettings persists project-level settings and the global language to config.toml.
@@ -3008,6 +3009,24 @@ func SaveProjectSettings(projectName string, update ProjectSettingsUpdate) error
 				proj.Platforms[j].Options["allow_from"] = strings.TrimSpace(af)
 			}
 		}
+		if update.PlatformOptions != nil {
+			for j := range proj.Platforms {
+				typ := strings.TrimSpace(proj.Platforms[j].Type)
+				if typ == "" {
+					continue
+				}
+				opts, found := update.PlatformOptions[typ]
+				if !found {
+					continue
+				}
+				if proj.Platforms[j].Options == nil {
+					proj.Platforms[j].Options = map[string]any{}
+				}
+				for k, v := range opts {
+					proj.Platforms[j].Options[k] = v
+				}
+			}
+		}
 		return saveConfig(cfg)
 	}
 	return fmt.Errorf("project %q not found", projectName)
@@ -3057,6 +3076,11 @@ func GetProjectConfigDetails(projectName string) map[string]any {
 			if plat.Options != nil {
 				if af, ok := plat.Options["allow_from"].(string); ok {
 					pc["allow_from"] = af
+				}
+				for _, optKey := range []string{"reaction_emoji", "done_emoji", "session_scope"} {
+					if v, ok := plat.Options[optKey].(string); ok {
+						pc[optKey] = v
+					}
 				}
 			}
 			platConfigs[j] = pc
@@ -3306,6 +3330,12 @@ func GetGlobalSettings() map[string]any {
 		rlWindow = *cfg.RateLimit.WindowSecs
 	}
 	result["rate_limit_window_secs"] = rlWindow
+	// Relay
+	relayVis := "full"
+	if cfg.Relay.Visibility != "" {
+		relayVis = cfg.Relay.Visibility
+	}
+	result["relay_visibility"] = relayVis
 	// Queue
 	queueMax := 5
 	if cfg.Queue.MaxDepth != nil {
@@ -3330,6 +3360,7 @@ type GlobalSettingsUpdate struct {
 	RateLimitMax       *int    `json:"rate_limit_max_messages"`
 	RateLimitWindow    *int    `json:"rate_limit_window_secs"`
 	QueueMaxDepth      *int    `json:"queue_max_depth"`
+	RelayVisibility    *string `json:"relay_visibility"`
 }
 
 // SaveGlobalSettings persists global settings to config.toml.
@@ -3385,6 +3416,9 @@ func SaveGlobalSettings(u GlobalSettingsUpdate) error {
 	}
 	if u.QueueMaxDepth != nil {
 		cfg.Queue.MaxDepth = u.QueueMaxDepth
+	}
+	if u.RelayVisibility != nil {
+		cfg.Relay.Visibility = *u.RelayVisibility
 	}
 	return saveConfig(cfg)
 }

@@ -13,6 +13,7 @@ export interface GlobalSettings {
   stream_preview_interval_ms: number;
   rate_limit_max_messages: number;
   rate_limit_window_secs: number;
+  relay_visibility: string;
 }
 
 export const getGlobalSettings = () => api.get<GlobalSettings>('/settings');

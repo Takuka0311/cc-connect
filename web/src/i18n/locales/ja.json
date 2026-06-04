@@ -262,6 +262,12 @@
     "robotCodeHint": "未入力の場合は Client ID を使用します",
     "cardTemplateId": "AI カードテンプレート ID",
     "cardTemplateIdHint": "DingTalk カードプラットフォームの AI カードテンプレート ID。設定するとストリーミングカードが有効になります",
+    "reactionEmoji": "リアクション絵文字",
+    "reactionEmojiHint": "受信メッセージへの絵文字リアクション。\"none\" で無効化",
+    "doneEmoji": "完了絵文字",
+    "doneEmojiHint": "エージェント完了時の絵文字リアクション。\"none\" で無効化",
+    "sessionScope": "セッション分離範囲",
+    "sessionScopeHint": "セッション分離レベル: user（デフォルト）、channel、thread",
     "cardTemplateKey": "カード内容の変数名",
     "cardThrottleMs": "カード更新間隔 (ミリ秒)"
   },
@@ -339,7 +345,10 @@
     "rlWindowSecs": "ウィンドウ（秒）",
     "rlWindowSecsHint": "タイムウィンドウの秒数",
     "log": "ログ",
-    "logLevel": "ログレベル"
+    "logLevel": "ログレベル",
+    "relay": "リレー",
+    "relayVisibility": "リレーの表示設定",
+    "relayVisibilityHint": "グループチャットでのリレーメッセージの表示方法: full、summary、none"
   },
   "globalProviders": {
     "title": "プロバイダー管理",

@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils';
 const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
 const ATTACHMENT_OPTS = ['', 'on', 'off'];
 const LANGUAGES = ['en', 'zh', 'zh-TW', 'ja', 'es'];
+const RELAY_VISIBILITY_OPTS = ['full', 'summary', 'none'];
 
 function Toggle({ value, onChange, label, hint }: { value: boolean; onChange: (v: boolean) => void; label: string; hint?: string }) {
   return (
@@ -83,6 +84,7 @@ export default function GlobalSettings() {
   const [spInterval, setSpInterval] = useState(1500);
   const [rlMax, setRlMax] = useState(20);
   const [rlWindow, setRlWindow] = useState(60);
+  const [relayVisibility, setRelayVisibility] = useState('full');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -100,6 +102,7 @@ export default function GlobalSettings() {
       setSpInterval(s.stream_preview_interval_ms ?? 1500);
       setRlMax(s.rate_limit_max_messages ?? 20);
       setRlWindow(s.rate_limit_window_secs ?? 60);
+      setRelayVisibility(s.relay_visibility || 'full');
     } catch {
       // ignore
     } finally {
@@ -126,6 +129,7 @@ export default function GlobalSettings() {
         stream_preview_interval_ms: spInterval,
         rate_limit_max_messages: rlMax,
         rate_limit_window_secs: rlWindow,
+        relay_visibility: relayVisibility,
       });
       setMsg(t('common.success'));
       setTimeout(() => setMsg(''), 3000);
@@ -240,6 +244,20 @@ export default function GlobalSettings() {
             onChange={setRlWindow}
             min={1}
             hint={t('settings.rlWindowSecsHint', 'Time window in seconds')}
+          />
+        </div>
+      </Card>
+
+      {/* Relay */}
+      <Card>
+        <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">{t('settings.relay', 'Relay')}</h3>
+        <div className="space-y-4 max-w-lg">
+          <Select
+            label={t('settings.relayVisibility', 'Relay visibility')}
+            value={relayVisibility}
+            onChange={setRelayVisibility}
+            hint={t('settings.relayVisibilityHint', 'Controls visibility of relay messages in group chat')}
+            options={RELAY_VISIBILITY_OPTS.map((v) => ({ value: v, label: v }))}
           />
         </div>
       </Card>

@@ -262,6 +262,12 @@
     "robotCodeHint": "不填則預設使用 Client ID",
     "cardTemplateId": "AI 卡片範本 ID",
     "cardTemplateIdHint": "釘釘卡片平台的 AI 卡片範本 ID，設定後啟用串流卡片輸出",
+    "reactionEmoji": "訊息表情回覆",
+    "reactionEmojiHint": "收到訊息時新增的表情回覆；設為 \"none\" 可停用",
+    "doneEmoji": "完成表情回覆",
+    "doneEmojiHint": "Agent 完成回覆後新增的表情；設為 \"none\" 可停用",
+    "sessionScope": "工作階段隔離範圍",
+    "sessionScopeHint": "工作階段隔離層級：user（預設）、channel 或 thread",
     "cardTemplateKey": "卡片內容變數名稱",
     "cardThrottleMs": "卡片更新間隔 (毫秒)"
   },
@@ -339,7 +345,10 @@
     "rlWindowSecs": "視窗時間（秒）",
     "rlWindowSecsHint": "時間視窗的秒數",
     "log": "記錄",
-    "logLevel": "記錄層級"
+    "logLevel": "記錄層級",
+    "relay": "中繼",
+    "relayVisibility": "中繼訊息可見性",
+    "relayVisibilityHint": "控制中繼訊息在群組中的顯示方式：full（完整）、summary（摘要）或 none（隱藏）"
   },
   "globalProviders": {
     "title": "服務商管理",

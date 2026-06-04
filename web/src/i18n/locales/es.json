@@ -262,6 +262,12 @@
     "robotCodeHint": "Usa el Client ID si se deja vacío",
     "cardTemplateId": "ID de plantilla de tarjeta IA",
     "cardTemplateIdHint": "ID de plantilla de tarjeta IA de la plataforma de tarjetas de DingTalk; habilita las tarjetas en streaming",
+    "reactionEmoji": "Emoji de reacción",
+    "reactionEmojiHint": "Emoji de reacción en mensajes entrantes; establece \"none\" para desactivar",
+    "doneEmoji": "Emoji de finalización",
+    "doneEmojiHint": "Emoji de reacción al terminar el agente; establece \"none\" para desactivar",
+    "sessionScope": "Ámbito de sesión",
+    "sessionScopeHint": "Aislamiento de sesión: user (predeterminado), channel o thread",
     "cardTemplateKey": "Variable de contenido de la tarjeta",
     "cardThrottleMs": "Intervalo de actualización de tarjeta (ms)"
   },
@@ -339,7 +345,10 @@
     "rlWindowSecs": "Ventana (seg)",
     "rlWindowSecsHint": "Ventana de tiempo en segundos",
     "log": "Registro",
-    "logLevel": "Nivel de registro"
+    "logLevel": "Nivel de registro",
+    "relay": "Relé",
+    "relayVisibility": "Visibilidad del relé",
+    "relayVisibilityHint": "Controla la visibilidad de los mensajes de relé en el chat grupal: full, summary o none"
   },
   "globalProviders": {
     "title": "Gestión de proveedores",

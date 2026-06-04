@@ -262,6 +262,12 @@
     "robotCodeHint": "不填则默认使用 Client ID",
     "cardTemplateId": "AI 卡片模板 ID",
     "cardTemplateIdHint": "钉钉卡片平台的 AI 卡片模板 ID，配置后启用流式卡片输出",
+    "reactionEmoji": "消息表情回复",
+    "reactionEmojiHint": "收到消息时添加的表情回复；设为 \"none\" 可禁用",
+    "doneEmoji": "完成表情回复",
+    "doneEmojiHint": "Agent 完成回复后添加的表情；设为 \"none\" 可禁用",
+    "sessionScope": "会话隔离范围",
+    "sessionScopeHint": "会话隔离级别：user（默认）、channel 或 thread",
     "cardTemplateKey": "卡片内容变量名",
     "cardThrottleMs": "卡片更新间隔 (毫秒)"
   },
@@ -339,7 +345,10 @@
     "rlWindowSecs": "窗口时间（秒）",
     "rlWindowSecsHint": "时间窗口的秒数",
     "log": "日志",
-    "logLevel": "日志级别"
+    "logLevel": "日志级别",
+    "relay": "中继",
+    "relayVisibility": "中继消息可见性",
+    "relayVisibilityHint": "控制中继消息在群聊中的展示方式：full（完整）、summary（摘要）或 none（隐藏）"
   },
   "globalProviders": {
     "title": "服务商管理",

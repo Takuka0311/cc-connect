@@ -54,6 +54,7 @@ export default function ProjectDetail() {
   const [replyFooter, setReplyFooter] = useState(true);
   const [injectSender, setInjectSender] = useState(false);
   const [platformAllowFrom, setPlatformAllowFrom] = useState<Record<string, string>>({});
+  const [platformOptions, setPlatformOptions] = useState<Record<string, Record<string, string>>>({});
   const [saving, setSaving] = useState(false);
 
   // Agent type
@@ -142,10 +143,17 @@ export default function ProjectDetail() {
         setInjectSender(proj.value.inject_sender === true);
         setProviderRefs(proj.value.provider_refs || []);
         const afMap: Record<string, string> = {};
+        const poMap: Record<string, Record<string, string>> = {};
         proj.value.platform_configs?.forEach(pc => {
           if (pc.allow_from !== undefined) afMap[pc.type] = pc.allow_from;
+          const opts: Record<string, string> = {};
+          if (pc.reaction_emoji !== undefined) opts.reaction_emoji = pc.reaction_emoji;
+          if (pc.done_emoji !== undefined) opts.done_emoji = pc.done_emoji;
+          if (pc.session_scope !== undefined) opts.session_scope = pc.session_scope;
+          if (Object.keys(opts).length > 0) poMap[pc.type] = opts;
         });
         setPlatformAllowFrom(afMap);
+        setPlatformOptions(poMap);
       }
       if (provs.status === 'fulfilled') {
         setProviders(provs.value.providers || []);
@@ -190,6 +198,7 @@ export default function ProjectDetail() {
         reply_footer: replyFooter,
         inject_sender: injectSender,
         platform_allow_from: platformAllowFrom,
+        platform_options: platformOptions,
       });
       if (res && (res as any).restart_required) {
         setShowRestartModal(true);
@@ -587,19 +596,44 @@ export default function ProjectDetail() {
           </div>
         </Card>
 
-        {/* Per-platform allow_from */}
+        {/* Per-platform settings */}
         {project.platform_configs && project.platform_configs.length > 0 && (
         <Card>
           <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-4">{t('projects.platformAccess', 'Platform access control')}</h3>
           <div className="space-y-3 max-w-lg">
             {project.platform_configs.map(pc => (
-              <Input
-                key={pc.type}
-                label={`${pc.type} — ${t('fields.allowFrom')}`}
-                value={platformAllowFrom[pc.type] ?? pc.allow_from ?? ''}
-                onChange={(e) => setPlatformAllowFrom(prev => ({ ...prev, [pc.type]: e.target.value }))}
-                placeholder='user1,user2 or *'
-              />
+              <div key={pc.type} className="space-y-2">
+                <Input
+                  label={`${pc.type} — ${t('fields.allowFrom')}`}
+                  value={platformAllowFrom[pc.type] ?? pc.allow_from ?? ''}
+                  onChange={(e) => setPlatformAllowFrom(prev => ({ ...prev, [pc.type]: e.target.value }))}
+                  placeholder='user1,user2 or *'
+                />
+                {pc.type === 'dingtalk' && (
+                  <>
+                    <Input
+                      label={`${pc.type} — ${t('fields.reactionEmoji')}`}
+                      value={platformOptions[pc.type]?.reaction_emoji ?? ''}
+                      onChange={(e) => setPlatformOptions(prev => ({ ...prev, [pc.type]: { ...prev[pc.type], reaction_emoji: e.target.value } }))}
+                      placeholder='🤔Thinking'
+                    />
+                    <Input
+                      label={`${pc.type} — ${t('fields.doneEmoji')}`}
+                      value={platformOptions[pc.type]?.done_emoji ?? ''}
+                      onChange={(e) => setPlatformOptions(prev => ({ ...prev, [pc.type]: { ...prev[pc.type], done_emoji: e.target.value } }))}
+                      placeholder='none'
+                    />
+                  </>
+                )}
+                {pc.type === 'slack' && (
+                  <Input
+                    label={`${pc.type} — ${t('fields.sessionScope')}`}
+                    value={platformOptions[pc.type]?.session_scope ?? ''}
+                    onChange={(e) => setPlatformOptions(prev => ({ ...prev, [pc.type]: { ...prev[pc.type], session_scope: e.target.value } }))}
+                    placeholder='user'
+                  />
+                )}
+              </div>
             ))}
           </div>
         </Card>
