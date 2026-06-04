@@ -196,6 +196,9 @@
   },
   "setup": {
     "addPlatform": "添加平台",
+    "editPlatform": "编辑",
+    "removePlatform": "移除平台",
+    "removePlatformConfirm": "确定要从该项目中移除 {{platform}} 吗？",
     "choosePlatform": "选择要连接的平台：",
     "scanToConnect": "扫描二维码以连接",
     "feishuLabel": "Feishu / Lark",

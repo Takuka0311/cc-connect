@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Eye, EyeOff, ChevronDown, AlertCircle } from 'lucide-react';
 import { Button } from '@/components/ui';
-import { addPlatformToProject } from '@/api/projects';
+import { addPlatformToProject, updatePlatformInProject } from '@/api/projects';
 import { platformMeta, type FieldDef } from '@/lib/platformMeta';
 import { cn } from '@/lib/utils';
 
@@ -11,14 +11,16 @@ interface Props {
   projectName: string;
   workDir?: string;
   agentType?: string;
+  initialValues?: Record<string, any>;
+  editMode?: boolean;
   onComplete: () => void;
   onCancel: () => void;
 }
 
-export default function PlatformManualForm({ platformType, projectName, workDir, agentType, onComplete, onCancel }: Props) {
+export default function PlatformManualForm({ platformType, projectName, workDir, agentType, initialValues, editMode, onComplete, onCancel }: Props) {
   const { t } = useTranslation();
   const meta = platformMeta[platformType];
-  const [values, setValues] = useState<Record<string, any>>({});
+  const [values, setValues] = useState<Record<string, any>>(initialValues || {});
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -35,10 +37,12 @@ export default function PlatformManualForm({ platformType, projectName, workDir,
   const advancedFields = meta.fields.filter(f => f.group === 'advanced');
 
   const handleSave = async () => {
-    const missing = meta.fields.filter(f => f.required && !values[f.key]);
-    if (missing.length > 0) {
-      setError(missing.map(f => t(f.labelKey)).join(', ') + ' required');
-      return;
+    if (!editMode) {
+      const missing = meta.fields.filter(f => f.required && !values[f.key]);
+      if (missing.length > 0) {
+        setError(missing.map(f => t(f.labelKey)).join(', ') + ' required');
+        return;
+      }
     }
 
     setSaving(true);
@@ -51,7 +55,11 @@ export default function PlatformManualForm({ platformType, projectName, workDir,
           opts[f.key] = v;
         }
       }
-      await addPlatformToProject(projectName, { type: platformType, options: opts, work_dir: workDir, agent_type: agentType });
+      if (editMode) {
+        await updatePlatformInProject(projectName, { type: platformType, options: opts });
+      } else {
+        await addPlatformToProject(projectName, { type: platformType, options: opts, work_dir: workDir, agent_type: agentType });
+      }
       onComplete();
     } catch (e: any) {
       setError(e?.message || String(e));
@@ -93,8 +101,8 @@ export default function PlatformManualForm({ platformType, projectName, workDir,
       )}
 
       <div className="flex justify-between pt-2">
-        <Button variant="secondary" size="sm" onClick={onCancel}>{t('common.back')}</Button>
-        <Button onClick={handleSave} loading={saving}>{t('setup.addPlatform', 'Add platform')}</Button>
+        <Button variant="secondary" size="sm" onClick={onCancel}>{editMode ? t('common.cancel') : t('common.back')}</Button>
+        <Button onClick={handleSave} loading={saving}>{editMode ? t('common.save') : t('setup.addPlatform', 'Add platform')}</Button>
       </div>
     </div>
   );

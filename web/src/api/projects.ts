@@ -14,6 +14,7 @@ export interface PlatformConfigInfo {
   reaction_emoji?: string;
   done_emoji?: string;
   session_scope?: string;
+  options?: Record<string, any>;
 }
 
 export interface ProjectDetail {
@@ -67,6 +68,13 @@ export const updateProject = (name: string, body: ProjectSettingsUpdate) => api.
 export const addPlatformToProject = (projectName: string, body: {
   type: string; options: Record<string, any>; work_dir?: string; agent_type?: string;
 }) => api.post<{ message: string; restart_required: boolean }>(`/projects/${projectName}/add-platform`, body);
+
+export const updatePlatformInProject = (projectName: string, body: {
+  type: string; options: Record<string, any>;
+}) => api.patch<{ message: string; restart_required: boolean }>(`/projects/${projectName}/update-platform`, body);
+
+export const removePlatformFromProject = (projectName: string, type: string) =>
+  api.post<{ message: string; restart_required: boolean }>(`/projects/${projectName}/remove-platform`, { type });
 
 export const deleteProject = (name: string) =>
   api.delete<{ message: string; restart_required: boolean }>(`/projects/${name}`);

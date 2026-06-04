@@ -3073,16 +3073,22 @@ func GetProjectConfigDetails(projectName string) map[string]any {
 		platConfigs := make([]map[string]any, len(p.Platforms))
 		for j, plat := range p.Platforms {
 			pc := map[string]any{"type": plat.Type}
+			opts := map[string]any{}
 			if plat.Options != nil {
+				for k, v := range plat.Options {
+					if isSensitiveKey(k) {
+						if s, ok := v.(string); ok && s != "" {
+							opts[k] = "****"
+						}
+					} else {
+						opts[k] = v
+					}
+				}
 				if af, ok := plat.Options["allow_from"].(string); ok {
 					pc["allow_from"] = af
 				}
-				for _, optKey := range []string{"reaction_emoji", "done_emoji", "session_scope"} {
-					if v, ok := plat.Options[optKey].(string); ok {
-						pc[optKey] = v
-					}
-				}
 			}
+			pc["options"] = opts
 			platConfigs[j] = pc
 		}
 		result["platform_configs"] = platConfigs
@@ -3194,6 +3200,86 @@ func AddPlatformToProject(projectName string, platform PlatformConfig, workDir, 
 		Platforms: []PlatformConfig{platform},
 	})
 	return saveConfig(cfg)
+}
+
+var sensitiveKeys = map[string]bool{
+	"token": true, "secret": true, "client_secret": true, "app_secret": true,
+	"corp_secret": true, "bot_token": true, "app_token": true,
+	"channel_secret": true, "channel_token": true, "api_key": true,
+	"callback_token": true, "callback_aes_key": true, "access_token": true,
+}
+
+func isSensitiveKey(key string) bool {
+	return sensitiveKeys[strings.ToLower(strings.TrimSpace(key))]
+}
+
+func UpdatePlatformInProject(projectName, platformType string, options map[string]any) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	for i := range cfg.Projects {
+		if cfg.Projects[i].Name != projectName {
+			continue
+		}
+		for j := range cfg.Projects[i].Platforms {
+			if !strings.EqualFold(cfg.Projects[i].Platforms[j].Type, platformType) {
+				continue
+			}
+			if cfg.Projects[i].Platforms[j].Options == nil {
+				cfg.Projects[i].Platforms[j].Options = map[string]any{}
+			}
+			for k, v := range options {
+				if s, ok := v.(string); ok && s == "****" {
+					continue
+				}
+				cfg.Projects[i].Platforms[j].Options[k] = v
+			}
+			return saveConfig(cfg)
+		}
+		return fmt.Errorf("platform %q not found in project %q", platformType, projectName)
+	}
+	return fmt.Errorf("project %q not found", projectName)
+}
+
+func RemovePlatformFromProject(projectName, platformType string) error {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	for i := range cfg.Projects {
+		if cfg.Projects[i].Name != projectName {
+			continue
+		}
+		platforms := cfg.Projects[i].Platforms
+		for j := range platforms {
+			if !strings.EqualFold(platforms[j].Type, platformType) {
+				continue
+			}
+			cfg.Projects[i].Platforms = append(platforms[:j], platforms[j+1:]...)
+			return saveConfig(cfg)
+		}
+		return fmt.Errorf("platform %q not found in project %q", platformType, projectName)
+	}
+	return fmt.Errorf("project %q not found", projectName)
 }
 
 func writeRawConfig(content string) error {

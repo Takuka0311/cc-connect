@@ -489,3 +489,64 @@ func (m *ManagementServer) handleProjectAddPlatform(w http.ResponseWriter, r *ht
 		"restart_required": true,
 	})
 }
+
+func (m *ManagementServer) handleProjectUpdatePlatform(w http.ResponseWriter, r *http.Request, projectName string) {
+	if r.Method != http.MethodPatch {
+		mgmtError(w, http.StatusMethodNotAllowed, "PATCH only")
+		return
+	}
+	var req struct {
+		Type    string         `json:"type"`
+		Options map[string]any `json:"options"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.Type == "" {
+		mgmtError(w, http.StatusBadRequest, "type is required")
+		return
+	}
+	if m.updatePlatformInProject == nil {
+		mgmtError(w, http.StatusServiceUnavailable, "config persistence not available")
+		return
+	}
+	if err := m.updatePlatformInProject(projectName, req.Type, req.Options); err != nil {
+		mgmtError(w, http.StatusInternalServerError, "update platform: "+err.Error())
+		return
+	}
+	mgmtJSON(w, http.StatusOK, map[string]any{
+		"message":          fmt.Sprintf("platform %q updated in project %q", req.Type, projectName),
+		"restart_required": true,
+	})
+}
+
+func (m *ManagementServer) handleProjectRemovePlatform(w http.ResponseWriter, r *http.Request, projectName string) {
+	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+		mgmtError(w, http.StatusMethodNotAllowed, "POST or DELETE only")
+		return
+	}
+	var req struct {
+		Type string `json:"type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.Type == "" {
+		mgmtError(w, http.StatusBadRequest, "type is required")
+		return
+	}
+	if m.removePlatformFromProject == nil {
+		mgmtError(w, http.StatusServiceUnavailable, "config persistence not available")
+		return
+	}
+	if err := m.removePlatformFromProject(projectName, req.Type); err != nil {
+		mgmtError(w, http.StatusInternalServerError, "remove platform: "+err.Error())
+		return
+	}
+	mgmtJSON(w, http.StatusOK, map[string]any{
+		"message":          fmt.Sprintf("platform %q removed from project %q", req.Type, projectName),
+		"restart_required": true,
+	})
+}

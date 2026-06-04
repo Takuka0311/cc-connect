@@ -759,6 +759,12 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 		return fmt.Errorf("dingtalk: invalid reply context type %T", rctx)
 	}
 
+	preview := content
+	if len(preview) > 80 {
+		preview = preview[:80] + "..."
+	}
+	slog.Info("dingtalk: Reply called", "content_len", len(content), "content_preview", preview, "proactive", rc.proactive)
+
 	// Fall back to proactive API when sessionWebhook is unavailable
 	if rc.proactive || rc.sessionWebhook == "" {
 		return p.sendProactiveMessage(ctx, rc, content)
@@ -1676,6 +1682,11 @@ func (p *Platform) StoreProactiveContext(sessionKey string, metadata map[string]
 // instead of the temporary sessionWebhook. This enables cc-connect send, cron,
 // webhook, and other proactive messaging features.
 func (p *Platform) sendProactiveMessage(ctx context.Context, rc replyContext, content string) error {
+	preview := content
+	if len(preview) > 80 {
+		preview = preview[:80] + "..."
+	}
+	slog.Info("dingtalk: sendProactiveMessage called", "content_len", len(content), "content_preview", preview, "isGroup", rc.isGroup)
 	token, err := p.getAccessToken()
 	if err != nil {
 		return fmt.Errorf("dingtalk: get access token for proactive send: %w", err)

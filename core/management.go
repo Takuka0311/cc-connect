@@ -53,8 +53,10 @@ type ManagementServer struct {
 
 	setupFeishuSave      func(req FeishuSetupSaveRequest) error
 	setupWeixinSave      func(req WeixinSetupSaveRequest) error
-	addPlatformToProject func(projectName, platType string, opts map[string]any, workDir, agentType string) error
-	removeProject        func(projectName string) error
+	addPlatformToProject    func(projectName, platType string, opts map[string]any, workDir, agentType string) error
+	updatePlatformInProject func(projectName, platType string, opts map[string]any) error
+	removePlatformFromProject func(projectName, platType string) error
+	removeProject           func(projectName string) error
 	saveProjectSettings  func(projectName string, update ProjectSettingsUpdate) error
 	getProjectConfig     func(projectName string) map[string]any
 	saveProviderRefs     func(projectName string, refs []string) error
@@ -127,6 +129,14 @@ func (m *ManagementServer) SetSetupWeixinSave(fn func(WeixinSetupSaveRequest) er
 
 func (m *ManagementServer) SetAddPlatformToProject(fn func(string, string, map[string]any, string, string) error) {
 	m.addPlatformToProject = fn
+}
+
+func (m *ManagementServer) SetUpdatePlatformInProject(fn func(string, string, map[string]any) error) {
+	m.updatePlatformInProject = fn
+}
+
+func (m *ManagementServer) SetRemovePlatformFromProject(fn func(string, string) error) {
+	m.removePlatformFromProject = fn
 }
 
 func (m *ManagementServer) SetRemoveProject(fn func(string) error) {
@@ -626,10 +636,16 @@ func (m *ManagementServer) handleProjectRoutes(w http.ResponseWriter, r *http.Re
 		rest = parts[2]
 	}
 
-	// add-platform writes config only; it does not need a running engine
-	// and must work for brand-new projects that have no engine yet.
-	if sub == "add-platform" {
+	// Platform config writes only — no running engine needed.
+	switch sub {
+	case "add-platform":
 		m.handleProjectAddPlatform(w, r, projName)
+		return
+	case "update-platform":
+		m.handleProjectUpdatePlatform(w, r, projName)
+		return
+	case "remove-platform":
+		m.handleProjectRemovePlatform(w, r, projName)
 		return
 	}
 

@@ -196,6 +196,9 @@
   },
   "setup": {
     "addPlatform": "プラットフォームを追加",
+    "editPlatform": "編集",
+    "removePlatform": "プラットフォームを削除",
+    "removePlatformConfirm": "このプロジェクトから {{platform}} を削除してもよろしいですか？",
     "choosePlatform": "接続するプラットフォームを選択：",
     "scanToConnect": "QRコードをスキャンして接続",
     "feishuLabel": "Feishu / Lark",

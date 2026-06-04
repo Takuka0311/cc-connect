@@ -3,10 +3,10 @@ import { useTranslation } from 'react-i18next';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft, Plug, Heart, Settings, Layers, Zap, Pause, Play,
-  Trash2, Plus, Check, Clock, ExternalLink, Link2,
+  Trash2, Plus, Check, Clock, ExternalLink, Link2, Pencil,
 } from 'lucide-react';
 import { Card, Badge, Button, Input, Modal, EmptyState } from '@/components/ui';
-import { getProject, updateProject, deleteProject, listAgentTypes, type ProjectDetail as ProjectDetailType } from '@/api/projects';
+import { getProject, updateProject, deleteProject, listAgentTypes, updatePlatformInProject, removePlatformFromProject, type ProjectDetail as ProjectDetailType } from '@/api/projects';
 import { listProviders, addProvider, removeProvider, activateProvider, type Provider, listGlobalProviders, type GlobalProvider, saveProviderRefs } from '@/api/providers';
 import { getHeartbeat, pauseHeartbeat, resumeHeartbeat, triggerHeartbeat, setHeartbeatInterval, type HeartbeatStatus } from '@/api/heartbeat';
 import { restartSystem } from '@/api/status';
@@ -79,6 +79,14 @@ export default function ProjectDetail() {
   const [showAddPlatform, setShowAddPlatform] = useState(false);
   const [addPlatType, setAddPlatType] = useState('');
   const [showRestartModal, setShowRestartModal] = useState(false);
+
+  // Edit/Remove platform
+  const [editPlatType, setEditPlatType] = useState('');
+  const [editPlatValues, setEditPlatValues] = useState<Record<string, any>>({});
+  const [showEditPlatform, setShowEditPlatform] = useState(false);
+  const [savingPlat, setSavingPlat] = useState(false);
+  const [showRemovePlatConfirm, setShowRemovePlatConfirm] = useState('');
+  const [removingPlat, setRemovingPlat] = useState(false);
 
   // Delete project
   const navigate = useNavigate();
@@ -276,12 +284,33 @@ export default function ProjectDetail() {
                 <Plus size={14} /> {t('setup.addPlatform', 'Add platform')}
               </Button>
             </div>
-            <div className="flex flex-wrap gap-2">
-              {project.platforms?.map((p) => (
-                <Badge key={p.type} variant={p.connected ? 'success' : 'danger'}>
-                  <Plug size={12} className="mr-1" /> {p.type} {p.connected ? '✓' : '✗'}
-                </Badge>
-              ))}
+            <div className="space-y-2">
+              {project.platforms?.map((p) => {
+                const pc = project.platform_configs?.find(c => c.type === p.type);
+                return (
+                  <div key={p.type} className="flex items-center justify-between px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700/60 bg-white dark:bg-gray-800/40">
+                    <div className="flex items-center gap-2">
+                      <Badge variant={p.connected ? 'success' : 'danger'}>
+                        <Plug size={12} className="mr-1" /> {p.type} {p.connected ? '✓' : '✗'}
+                      </Badge>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      {platformMeta[p.type] && (
+                        <Button size="sm" variant="ghost" onClick={() => {
+                          setEditPlatType(p.type);
+                          setEditPlatValues(pc?.options || {});
+                          setShowEditPlatform(true);
+                        }}>
+                          <Pencil size={14} /> {t('setup.editPlatform', 'Edit')}
+                        </Button>
+                      )}
+                      <Button size="sm" variant="ghost" className="text-gray-400 hover:text-red-500" onClick={() => setShowRemovePlatConfirm(p.type)}>
+                        <Trash2 size={14} />
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </Card>
           <Card>
@@ -727,6 +756,49 @@ export default function ProjectDetail() {
             <Button variant="secondary" onClick={() => setAddPlatType('')}>{t('common.back')}</Button>
           </div>
         )}
+      </Modal>
+
+      {/* Edit Platform Modal */}
+      <Modal open={showEditPlatform} onClose={() => setShowEditPlatform(false)} title={t('setup.editPlatform', 'Edit platform')}>
+        {editPlatType && platformMeta[editPlatType] && (
+          <PlatformManualForm
+            platformType={editPlatType}
+            projectName={name!}
+            initialValues={editPlatValues}
+            editMode
+            onComplete={() => {
+              setShowEditPlatform(false);
+              setShowRestartModal(true);
+            }}
+            onCancel={() => setShowEditPlatform(false)}
+          />
+        )}
+      </Modal>
+
+      {/* Remove Platform Confirm */}
+      <Modal open={!!showRemovePlatConfirm} onClose={() => setShowRemovePlatConfirm('')} title={t('setup.removePlatform', 'Remove platform')}>
+        <div className="space-y-4 py-2">
+          <p className="text-sm text-gray-600 dark:text-gray-400">
+            {t('setup.removePlatformConfirm', 'Are you sure you want to remove {{platform}} from this project?', { platform: showRemovePlatConfirm })}
+          </p>
+          <div className="flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => setShowRemovePlatConfirm('')}>{t('common.cancel')}</Button>
+            <Button variant="danger" disabled={removingPlat} onClick={async () => {
+              setRemovingPlat(true);
+              try {
+                await removePlatformFromProject(name!, showRemovePlatConfirm);
+                setShowRemovePlatConfirm('');
+                setShowRestartModal(true);
+              } catch (e: any) {
+                alert(e?.message || String(e));
+              } finally {
+                setRemovingPlat(false);
+              }
+            }}>
+              {removingPlat ? t('common.deleting', 'Removing...') : t('common.delete')}
+            </Button>
+          </div>
+        </div>
       </Modal>
 
       {/* Restart Required Modal */}
