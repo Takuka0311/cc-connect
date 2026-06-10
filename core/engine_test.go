@@ -2193,6 +2193,12 @@ func TestAgentSystemPrompt_MentionsAttachmentSend(t *testing.T) {
 	if !strings.Contains(prompt, "cc-connect send --file") {
 		t.Fatalf("prompt missing file send instructions: %q", prompt)
 	}
+	if !strings.Contains(prompt, "cc-connect send --tts") {
+		t.Fatalf("prompt missing tts send instructions: %q", prompt)
+	}
+	if !strings.Contains(prompt, "NO_REPLY") {
+		t.Fatalf("prompt missing silent reply guidance for voice tool: %q", prompt)
+	}
 }
 
 func countCardActionValues(card *Card, prefix string) int {
@@ -11962,6 +11968,107 @@ func TestEstimateTokensWithPendingAssistant(t *testing.T) {
 	}
 }
 
+type recordingTTS struct {
+	mu    sync.Mutex
+	text  string
+	opts  TTSSynthesisOpts
+	calls int
+}
+
+func (t *recordingTTS) Synthesize(_ context.Context, text string, opts TTSSynthesisOpts) ([]byte, string, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.text = text
+	t.opts = opts
+	t.calls++
+	return []byte("audio-bytes"), "mp3", nil
+}
+
+func (t *recordingTTS) snapshot() (string, TTSSynthesisOpts, int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.text, t.opts, t.calls
+}
+
+type audioStubPlatform struct {
+	stubPlatformEngine
+	mu         sync.Mutex
+	audio      []byte
+	format     string
+	audioCalls int
+}
+
+func (p *audioStubPlatform) SendAudio(_ context.Context, _ any, audio []byte, format string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.audio = append([]byte(nil), audio...)
+	p.format = format
+	p.audioCalls++
+	return nil
+}
+
+func (p *audioStubPlatform) audioSnapshot() ([]byte, string, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]byte(nil), p.audio...), p.format, p.audioCalls
+}
+
+func TestSynthesizedTTSReply_PropagatesSpeed(t *testing.T) {
+	tts := &recordingTTS{}
+	p := &audioStubPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e := NewEngine("assistant", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetTTSConfig(&TTSCfg{Enabled: true, Voice: "voice-b", Speed: 1.06, TTS: tts})
+
+	if err := e.synthesizeAndSendTTS(p, "ctx", "hello"); err != nil {
+		t.Fatalf("synthesizeAndSendTTS() error = %v", err)
+	}
+	_, opts, calls := tts.snapshot()
+	if calls != 1 {
+		t.Fatalf("tts calls = %d, want 1", calls)
+	}
+	if opts.Speed != 1.06 {
+		t.Fatalf("speed = %v, want 1.06", opts.Speed)
+	}
+}
+
+func TestSynthesizedTTSReply_ErrorWhenTTSDisabled(t *testing.T) {
+	p := &audioStubPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e := NewEngine("assistant", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetTTSConfig(&TTSCfg{Enabled: false, TTS: &recordingTTS{}})
+
+	err := e.synthesizeAndSendTTS(p, "ctx", "hello")
+	if err == nil || !strings.Contains(err.Error(), "tts is not configured") {
+		t.Fatalf("error = %v, want tts is not configured", err)
+	}
+}
+
+func TestSynthesizedTTSReply_ErrorWhenProviderMissing(t *testing.T) {
+	p := &audioStubPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e := NewEngine("assistant", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetTTSConfig(&TTSCfg{Enabled: true})
+
+	err := e.synthesizeAndSendTTS(p, "ctx", "hello")
+	if err == nil || !strings.Contains(err.Error(), "tts provider is not configured") {
+		t.Fatalf("error = %v, want tts provider is not configured", err)
+	}
+}
+
+func TestSynthesizedTTSReply_ErrorWhenPlatformCannotSendAudio(t *testing.T) {
+	tts := &recordingTTS{}
+	p := &stubPlatformEngine{n: "discord"}
+	e := NewEngine("assistant", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetTTSConfig(&TTSCfg{Enabled: true, TTS: tts})
+
+	err := e.synthesizeAndSendTTS(p, "ctx", "hello")
+	if err == nil || !strings.Contains(err.Error(), "platform discord does not support audio sending") {
+		t.Fatalf("error = %v, want unsupported audio sender error", err)
+	}
+	_, _, calls := tts.snapshot()
+	if calls != 0 {
+		t.Fatalf("tts calls = %d, want 0", calls)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Engine setter method coverage tests
 // ---------------------------------------------------------------------------
@@ -14119,4 +14226,103 @@ func TestMaybeAutoResetSessionOnIdle_NotFiredWhenUserActivityRecent(t *testing.T
 	if rotated != nil {
 		t.Fatal("expected no idle reset because LastUserActivity is only 5min ago")
 	}
+}
+
+// TestHandlePendingPermission_StalePermissionCallback_Dropped verifies that
+// permission-callback messages synthesized by inline-button / card-action paths
+// (Telegram callback_query, Feishu card_action, QQBot interaction button, and
+// the bridge web admin card_action) are silently dropped when there is no
+// matching interactive state or pending request — instead of letting the
+// literal "allow" / "deny" string reach the agent's prompt stream. Plain
+// text "allow" / "deny" from a real user must continue to fall through
+// (return false) so the caller can route them through the normal message
+// handler. Regression test for #826.
+func TestHandlePendingPermission_StalePermissionCallback_Dropped(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+
+	t.Run("no interactive state — stale callback is dropped (returns true)", func(t *testing.T) {
+		msg := &Message{
+			SessionKey:           "ghost-session",
+			Content:              "allow",
+			IsPermissionResponse: true,
+		}
+		if !e.handlePendingPermission(p, msg, "allow", "ghost-ikey") {
+			t.Fatal("handlePendingPermission returned false, want true (drop stale callback)")
+		}
+		if rec.calls != 0 {
+			t.Fatalf("RespondPermission called %d times, want 0 (stale callback must not reach agent)", rec.calls)
+		}
+	})
+
+	t.Run("no pending request — stale callback is dropped (returns true)", func(t *testing.T) {
+		iKey := "ws:sk-stale-no-pending"
+		e.interactiveMu.Lock()
+		e.interactiveStates[iKey] = &interactiveState{
+			agentSession: rec,
+			pending:      nil,
+		}
+		e.interactiveMu.Unlock()
+
+		msg := &Message{
+			SessionKey:           "sk-stale-no-pending",
+			Content:              "deny",
+			IsPermissionResponse: true,
+		}
+		if !e.handlePendingPermission(p, msg, "deny", iKey) {
+			t.Fatal("handlePendingPermission returned false, want true (drop stale callback)")
+		}
+		if rec.calls != 0 {
+			t.Fatalf("RespondPermission called %d times, want 0 (stale callback must not reach agent)", rec.calls)
+		}
+	})
+
+	t.Run("plain text 'allow' from real user falls through (returns false)", func(t *testing.T) {
+		// No flag, no state → must return false so caller routes to normal handler.
+		msg := &Message{
+			SessionKey: "sk-plain",
+			Content:    "allow",
+		}
+		if e.handlePendingPermission(p, msg, "allow", "sk-plain-ikey") {
+			t.Fatal("handlePendingPermission returned true, want false (plain user message must fall through)")
+		}
+		if rec.calls != 0 {
+			t.Fatalf("RespondPermission called %d times, want 0 (plain user message should not auto-resolve)", rec.calls)
+		}
+	})
+
+	t.Run("matching pending request — callback still resolves", func(t *testing.T) {
+		iKey := "ws:sk-fresh"
+		pending := &pendingPermission{
+			RequestID: "req-fresh",
+			ToolName:  "Bash",
+			ToolInput: map[string]any{"command": "ls"},
+			Resolved:  make(chan struct{}),
+		}
+		e.interactiveMu.Lock()
+		e.interactiveStates[iKey] = &interactiveState{
+			agentSession: rec,
+			pending:      pending,
+		}
+		e.interactiveMu.Unlock()
+
+		msg := &Message{
+			SessionKey:           "sk-fresh",
+			Content:              "allow",
+			IsPermissionResponse: true,
+		}
+		if !e.handlePendingPermission(p, msg, "allow", iKey) {
+			t.Fatal("handlePendingPermission returned false, want true (matching pending must resolve)")
+		}
+		if rec.calls != 1 {
+			t.Fatalf("RespondPermission calls = %d, want 1", rec.calls)
+		}
+		if rec.lastID != "req-fresh" {
+			t.Fatalf("RespondPermission id = %q, want req-fresh", rec.lastID)
+		}
+		if rec.lastResult.Behavior != "allow" {
+			t.Fatalf("RespondPermission behavior = %q, want allow", rec.lastResult.Behavior)
+		}
+	})
 }

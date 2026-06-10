@@ -770,11 +770,19 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 		return p.sendProactiveMessage(ctx, rc, content)
 	}
 
+	atUserIds := extractAtUserIds(content)
+
 	content = preprocessDingTalkMarkdown(content)
 
 	payload := map[string]any{
 		"msgtype":  "markdown",
 		"markdown": map[string]string{"title": "reply", "text": content},
+	}
+	if len(atUserIds) > 0 {
+		payload["at"] = map[string]any{
+			"atUserIds": atUserIds,
+			"isAtAll":   false,
+		}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1819,11 +1827,25 @@ func (p *Platform) getNotifyContext(userID string) (map[string]string, bool) {
 	if !ok {
 		return nil, false
 	}
-	// Expire after 24 hours
 	if time.Since(entry.timestamp) > 24*time.Hour {
 		return nil, false
 	}
 	return entry.metadata, true
+}
+
+var atUserIDRegexp = regexp.MustCompile(`@(\d{4,})`)
+
+func extractAtUserIds(content string) []string {
+	matches := atUserIDRegexp.FindAllStringSubmatch(content, -1)
+	seen := make(map[string]bool)
+	var ids []string
+	for _, m := range matches {
+		if len(m) > 1 && !seen[m[1]] {
+			seen[m[1]] = true
+			ids = append(ids, m[1])
+		}
+	}
+	return ids
 }
 
 // preprocessDingTalkMarkdown adapts content for DingTalk's markdown renderer:

@@ -36,6 +36,7 @@ type SendRequest struct {
 	Project    string            `json:"project"`
 	SessionKey string            `json:"session_key"`
 	Message    string            `json:"message"`
+	TTSText    string            `json:"tts_text,omitempty"`
 	Images     []ImageAttachment `json:"images,omitempty"`
 	Files      []FileAttachment  `json:"files,omitempty"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
@@ -152,8 +153,8 @@ func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req.Message == "" && len(req.Images) == 0 && len(req.Files) == 0 {
-		http.Error(w, "message or attachment is required", http.StatusBadRequest)
+	if req.Message == "" && strings.TrimSpace(req.TTSText) == "" && len(req.Images) == 0 && len(req.Files) == 0 {
+		http.Error(w, "message, tts_text, or attachment is required", http.StatusBadRequest)
 		return
 	}
 
@@ -183,9 +184,18 @@ func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := engine.SendToSessionWithMetadata(req.SessionKey, req.Message, req.Images, req.Files, req.Metadata, req.AtUsers, req.AtAll); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	if req.Message != "" || len(req.Images) > 0 || len(req.Files) > 0 {
+		if err := engine.SendToSessionWithMetadata(req.SessionKey, req.Message, req.Images, req.Files, req.Metadata, req.AtUsers, req.AtAll); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	if strings.TrimSpace(req.TTSText) != "" {
+		if err := engine.SendTTSToSession(req.SessionKey, req.TTSText); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	apiJSON(w, http.StatusOK, map[string]string{"status": "ok"})

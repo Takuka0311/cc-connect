@@ -247,6 +247,11 @@ type Engine struct {
 	// Default false = show all sessions.
 	filterExternalSessions bool
 
+	// Shell configuration for /shell, cron exec, hooks, webhook exec
+	shell       string // shell binary path (e.g. "sh", "/bin/zsh")
+	shellFlag   string // shell flag (e.g. "-c", "-Command", "/C")
+	shellProfile string // prepended to every command (e.g. "source ~/.zshrc;")
+
 	// Multi-workspace mode
 	multiWorkspace               bool
 	baseDir                      string
@@ -537,6 +542,8 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		maxQueuedMessages:     defaultMaxQueuedMessages,
 		showContextIndicator:  true,
 		showWorkdirIndicator:  true,
+		shell:                 defaultShell(),
+		shellFlag:             defaultShellFlag(),
 	}
 
 	if ag != nil {
@@ -636,6 +643,13 @@ func (e *Engine) reapIdleWorkspaces() {
 // SetHooks configures the lifecycle event hook manager.
 func (e *Engine) SetHooks(hm *HookManager) {
 	e.hooks = hm
+}
+
+// SetShell configures the shell binary, flag, and shell profile used for exec.
+func (e *Engine) SetShell(shell, flag, shellProfile string) {
+	e.shell = shell
+	e.shellFlag = flag
+	e.shellProfile = shellProfile
 }
 
 func (e *Engine) SetSpeechConfig(cfg SpeechCfg) {
@@ -1395,12 +1409,7 @@ func (e *Engine) executeCronShell(p Platform, replyCtx any, job *CronJob) error 
 	ctx, cancel := context.WithTimeout(e.ctx, timeout)
 	defer cancel()
 
-	var shellCmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		shellCmd = exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", job.Exec)
-	} else {
-		shellCmd = exec.CommandContext(ctx, "sh", "-c", job.Exec)
-	}
+	shellCmd := shellExecCommand(ctx, e.shell, e.shellFlag, e.shellProfile, job.Exec)
 	shellCmd.Dir = workDir
 
 	stdout, err := shellCmd.StdoutPipe()
@@ -2594,6 +2603,18 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 	state, ok := e.interactiveStates[iKey]
 	e.interactiveMu.Unlock()
 	if !ok || state == nil {
+		// Stale platform-callback permission click (e.g. user tapped an old
+		// "Allow"/"Deny" button after the session was reset, the bot was
+		// restarted, or the card message ID was redelivered). Drop silently so
+		// the synthesized "allow"/"deny" payload is not forwarded to the
+		// agent as user input (issue #826). Only applies to permission
+		// callbacks — plain text "allow"/"deny" from a real user falls
+		// through to the normal message handler below.
+		if msg.IsPermissionResponse {
+			slog.Debug("dropping stale permission callback (no interactive state)",
+				"session", msg.SessionKey, "content", content)
+			return true
+		}
 		return false
 	}
 
@@ -2601,6 +2622,11 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 	pending := state.pending
 	state.mu.Unlock()
 	if pending == nil {
+		if msg.IsPermissionResponse {
+			slog.Debug("dropping stale permission callback (no pending request)",
+				"session", msg.SessionKey, "content", content)
+			return true
+		}
 		return false
 	}
 
@@ -3170,6 +3196,20 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 	// is unbound, force a fresh start instead of attaching to whichever CLI
 	// conversation happens to be "latest" in this workspace.
 	startSessionID := session.GetAgentSessionID()
+	// Cross-project session leakage guard (issue #599): if a session ID was
+	// inherited from a different project's workspace (e.g. another
+	// cc-connect project that happens to share a Session row), the agent
+	// can detect the mismatch and we should clear the ID rather than
+	// resume a conversation that has nothing to do with this project.
+	if startSessionID != "" {
+		if validator, ok := agent.(SessionIDValidator); ok && !validator.ValidateSessionID(e.ctx, startSessionID) {
+			slog.Warn("session ID does not belong to this project, clearing it",
+				"session_key", sessionKey, "invalid_session_id", startSessionID)
+			session.SetAgentSessionID("", agent.Name())
+			sessions.Save()
+			startSessionID = ""
+		}
+	}
 	isResume := startSessionID != ""
 	startAt := time.Now()
 	agentSession, err := agent.StartSession(e.ctx, startSessionID)
@@ -6589,6 +6629,35 @@ func (e *Engine) cmdShow(p Platform, msg *Message, args []string) {
 // quickFinishTimeout is how long to wait before assuming the command is long-running.
 const quickFinishTimeout = 500 * time.Millisecond
 
+// shellExecCommand builds an exec.Cmd for running command via the given shell.
+// For PowerShell/pwsh, extra flags (-NoProfile, -ExecutionPolicy Bypass) are
+// added automatically. If shellProfile is non-empty, it is prepended to the command
+// with a newline separator (useful for sourcing shell profiles).
+func shellExecCommand(ctx context.Context, shell, flag, shellProfile, command string) *exec.Cmd {
+	if shellProfile != "" {
+		command = shellProfile + "\n" + command
+	}
+	base := strings.ToLower(filepath.Base(shell))
+	if strings.HasPrefix(base, "powershell") || strings.HasPrefix(base, "pwsh") {
+		return exec.CommandContext(ctx, shell, "-NoProfile", "-ExecutionPolicy", "Bypass", flag, command)
+	}
+	return exec.CommandContext(ctx, shell, flag, command)
+}
+
+func defaultShell() string {
+	if runtime.GOOS == "windows" {
+		return "powershell.exe"
+	}
+	return "sh"
+}
+
+func defaultShellFlag() string {
+	if runtime.GOOS == "windows" {
+		return "-Command"
+	}
+	return "-c"
+}
+
 // runShellWithProgress executes a shell command with live progress feedback.
 // Strategy: start the command, wait 500ms. If it finishes within that window,
 // just send the result directly (no intermediate messages). If it's still running,
@@ -6599,12 +6668,7 @@ func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, 
 	ctx, cancel := context.WithTimeout(e.ctx, timeout)
 	defer cancel()
 
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command)
-	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", command)
-	}
+	cmd := shellExecCommand(ctx, e.shell, e.shellFlag, e.shellProfile, command)
 	cmd.Dir = workDir
 
 	stdout, err := cmd.StdoutPipe()
@@ -9670,89 +9734,9 @@ func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images
 }
 
 func (e *Engine) SendToSessionWithMetadata(sessionKey, message string, images []ImageAttachment, files []FileAttachment, metadata map[string]string, atUsers []string, atAll bool) error {
-	e.interactiveMu.Lock()
-
-	var state *interactiveState
-	if sessionKey != "" {
-		state = e.interactiveStates[sessionKey]
-		if state == nil && e.multiWorkspace {
-			// We already hold interactiveMu, so call the *Locked variant
-			// to avoid a self-deadlock on the non-reentrant mutex.
-			if iKey := e.interactiveKeyForSessionKeyLocked(sessionKey); iKey != sessionKey {
-				state = e.interactiveStates[iKey]
-			}
-		}
-	} else if len(e.interactiveStates) == 1 {
-		// Single session: use it when no sessionKey is provided (backward compatible)
-		for _, s := range e.interactiveStates {
-			state = s
-			break
-		}
-	} else if len(e.interactiveStates) > 1 && (len(images) > 0 || len(files) > 0) {
-		// Multiple sessions with attachments but no explicit sessionKey: ambiguous
-		e.interactiveMu.Unlock()
-		return fmt.Errorf("multiple active sessions; must specify --session to send attachments")
-	} else {
-		// Multiple sessions but text-only: pick the first (legacy behavior)
-		for _, s := range e.interactiveStates {
-			state = s
-			break
-		}
-	}
-	e.interactiveMu.Unlock()
-
-	var p Platform
-	var replyCtx any
-	effectiveSessionKey := sessionKey
-	if state != nil {
-		state.mu.Lock()
-		p = state.platform
-		replyCtx = state.replyCtx
-		state.mu.Unlock()
-	}
-
-	if p == nil && sessionKey != "" {
-		strippedKey := sessionKey
-		platformName := ""
-		if idx := strings.Index(strippedKey, ":"); idx > 0 {
-			platformName = strippedKey[:idx]
-		}
-		var targetPlatform Platform
-		for _, candidate := range e.platforms {
-			if candidate.Name() == platformName {
-				targetPlatform = candidate
-				break
-			}
-		}
-		// Fallback: multi-workspace mode may prefix the session key with the
-		// workspace path (same heuristic as ExecuteCronJob / ExecuteHeartbeat).
-		if targetPlatform == nil {
-			for _, candidate := range e.platforms {
-				needle := ":" + candidate.Name() + ":"
-				if idx := strings.Index(strippedKey, needle); idx >= 0 {
-					targetPlatform = candidate
-					strippedKey = strippedKey[idx+1:]
-					break
-				}
-			}
-		}
-		if targetPlatform != nil {
-			rc, ok := targetPlatform.(ReplyContextReconstructor)
-			if !ok {
-				return fmt.Errorf("platform %q does not support proactive messaging", targetPlatform.Name())
-			}
-			reconstructed, err := rc.ReconstructReplyCtx(strippedKey)
-			if err != nil {
-				return fmt.Errorf("reconstruct reply context: %w", err)
-			}
-			p = targetPlatform
-			replyCtx = reconstructed
-			effectiveSessionKey = strippedKey
-		}
-	}
-
-	if p == nil {
-		return fmt.Errorf("no active session found (key=%q)", sessionKey)
+	state, p, replyCtx, err := e.resolveOutboundSessionTarget(sessionKey, len(images) > 0 || len(files) > 0)
+	if err != nil {
+		return err
 	}
 
 	if message == "" && len(images) == 0 && len(files) == 0 {
@@ -9763,7 +9747,7 @@ func (e *Engine) SendToSessionWithMetadata(sessionKey, message string, images []
 	}
 	if len(metadata) > 0 {
 		if storer, ok := p.(ProactiveContextStorer); ok {
-			storer.StoreProactiveContext(effectiveSessionKey, metadata)
+			storer.StoreProactiveContext(sessionKey, metadata)
 		}
 	}
 
@@ -9789,8 +9773,7 @@ func (e *Engine) SendToSessionWithMetadata(sessionKey, message string, images []
 		if err := e.waitOutgoing(p); err != nil {
 			return err
 		}
-		// Use AtMentionSender when @users specified and platform supports it
-		if (len(atUsers) > 0 || atAll) {
+		if len(atUsers) > 0 || atAll {
 			if atSender, ok := p.(AtMentionSender); ok {
 				if err := atSender.ReplyWithAt(e.ctx, replyCtx, message, atUsers, atAll); err != nil {
 					return err
@@ -9828,6 +9811,105 @@ func (e *Engine) SendToSessionWithMetadata(sessionKey, message string, images []
 		}
 	}
 	return nil
+}
+
+// SendTTSToSession synthesizes and sends a voice message to an active session.
+func (e *Engine) SendTTSToSession(sessionKey, text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fmt.Errorf("tts text is required")
+	}
+	_, p, replyCtx, err := e.resolveOutboundSessionTarget(sessionKey, false)
+	if err != nil {
+		return err
+	}
+	return e.synthesizeAndSendTTS(p, replyCtx, text)
+}
+
+func (e *Engine) resolveOutboundSessionTarget(sessionKey string, hasAttachments bool) (*interactiveState, Platform, any, error) {
+	e.interactiveMu.Lock()
+
+	var state *interactiveState
+	if sessionKey != "" {
+		state = e.interactiveStates[sessionKey]
+		if state == nil && e.multiWorkspace {
+			// We already hold interactiveMu, so call the *Locked variant
+			// to avoid a self-deadlock on the non-reentrant mutex.
+			if iKey := e.interactiveKeyForSessionKeyLocked(sessionKey); iKey != sessionKey {
+				state = e.interactiveStates[iKey]
+			}
+		}
+	} else if len(e.interactiveStates) == 1 {
+		// Single session: use it when no sessionKey is provided (backward compatible)
+		for _, s := range e.interactiveStates {
+			state = s
+			break
+		}
+	} else if len(e.interactiveStates) > 1 && hasAttachments {
+		// Multiple sessions with attachments but no explicit sessionKey: ambiguous
+		e.interactiveMu.Unlock()
+		return nil, nil, nil, fmt.Errorf("multiple active sessions; must specify --session to send attachments")
+	} else {
+		// Multiple sessions but text-only: pick the first (legacy behavior)
+		for _, s := range e.interactiveStates {
+			state = s
+			break
+		}
+	}
+	e.interactiveMu.Unlock()
+
+	var p Platform
+	var replyCtx any
+	if state != nil {
+		state.mu.Lock()
+		p = state.platform
+		replyCtx = state.replyCtx
+		state.mu.Unlock()
+	}
+
+	if p == nil && sessionKey != "" {
+		strippedKey := sessionKey
+		platformName := ""
+		if idx := strings.Index(strippedKey, ":"); idx > 0 {
+			platformName = strippedKey[:idx]
+		}
+		var targetPlatform Platform
+		for _, candidate := range e.platforms {
+			if candidate.Name() == platformName {
+				targetPlatform = candidate
+				break
+			}
+		}
+		// Fallback: multi-workspace mode may prefix the session key with the
+		// workspace path (same heuristic as ExecuteCronJob / ExecuteHeartbeat).
+		if targetPlatform == nil {
+			for _, candidate := range e.platforms {
+				needle := ":" + candidate.Name() + ":"
+				if idx := strings.Index(strippedKey, needle); idx >= 0 {
+					targetPlatform = candidate
+					strippedKey = strippedKey[idx+1:]
+					break
+				}
+			}
+		}
+		if targetPlatform != nil {
+			rc, ok := targetPlatform.(ReplyContextReconstructor)
+			if !ok {
+				return nil, nil, nil, fmt.Errorf("platform %q does not support proactive messaging", targetPlatform.Name())
+			}
+			reconstructed, err := rc.ReconstructReplyCtx(strippedKey)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("reconstruct reply context: %w", err)
+			}
+			p = targetPlatform
+			replyCtx = reconstructed
+		}
+	}
+
+	if p == nil {
+		return nil, nil, nil, fmt.Errorf("no active session found (key=%q)", sessionKey)
+	}
+	return state, p, replyCtx, nil
 }
 
 // sendPermissionPrompt sends a permission prompt with interactive buttons when
@@ -10370,6 +10452,8 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 // executeCardAction performs the side-effect for act: prefixed actions
 // (e.g. switching model/mode/lang) before the card is re-rendered.
 func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+
 	switch cmd {
 	case "/model":
 		if args == "" {
@@ -10392,7 +10476,6 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 			target = resolveModelSwitchTarget(target, models)
 		}
 		cancel()
-		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 		e.cleanupInteractiveState(interactiveKey)
 		e.interactiveMu.Lock()
 		state := e.interactiveStates[interactiveKey]
@@ -10422,7 +10505,6 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		for _, effort := range efforts {
 			if effort == target {
 				switcher.SetReasoningEffort(target)
-				interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 				e.cleanupInteractiveState(interactiveKey)
 				s := e.sessions.GetOrCreateActive(sessionKey)
 				s.SetAgentSessionID("", "")
@@ -10442,7 +10524,6 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		}
 		newMode := strings.ToLower(args)
 		switcher.SetMode(newMode)
-		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 		if e.applyLiveModeChange(sessionKey, switcher.GetMode()) {
 			e.cleanupInteractiveState(interactiveKey)
 			return
@@ -10491,7 +10572,6 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 			provName = ""
 		}
 		if switcher.SetActiveProvider(provName) {
-			interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 			e.cleanupInteractiveState(interactiveKey)
 			s := e.sessions.GetOrCreateActive(sessionKey)
 			s.SetAgentSessionID("", "")
@@ -10546,7 +10626,6 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		e.executeProviderLink(sessionKey, args)
 
 	case "/new":
-		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 		_, sessions := e.sessionContextForKey(sessionKey)
 		e.cleanupInteractiveState(interactiveKey)
 		sessions.NewSession(sessionKey, "")
@@ -10568,7 +10647,6 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		if matched == nil {
 			return
 		}
-		interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
 		e.cleanupInteractiveState(interactiveKey)
 		session := sessions.SwitchToAgentSession(sessionKey, matched.ID, agent.Name(), matched.Summary)
 		session.ClearHistory()
@@ -10600,8 +10678,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		}
 
 	case "/stop":
-		sessionKey = e.interactiveKeyForSessionKey(sessionKey)
-		e.stopInteractiveSession(sessionKey, nil, nil)
+		e.stopInteractiveSession(interactiveKey, nil, nil)
 
 	case "/heartbeat":
 		if e.heartbeatScheduler == nil {
@@ -13670,53 +13747,117 @@ func splitMessage(text string, maxLen int) []string {
 // Called asynchronously after EventResult; text reply is always sent first.
 func (e *Engine) sendTTSReply(p Platform, replyCtx any, text string) {
 	slog.Debug("tts: sendTTSReply called", "platform", p.Name(), "text_len", len(text))
-	if e.tts == nil {
-		slog.Warn("tts: e.tts is nil, skipping")
-		return
+	if err := e.synthesizeAndSendTTS(p, replyCtx, text); err != nil {
+		slog.Error("tts: voice reply failed", "platform", p.Name(), "error", err)
+	}
+}
+
+func (e *Engine) synthesizeAndSendTTS(p Platform, replyCtx any, text string) error {
+	if e.tts == nil || !e.tts.Enabled {
+		return fmt.Errorf("tts is not configured")
 	}
 	if e.tts.TTS == nil {
-		slog.Warn("tts: e.tts.TTS is nil, skipping")
-		return
+		return fmt.Errorf("tts provider is not configured")
 	}
 	if e.tts.MaxTextLen > 0 && utf8.RuneCountInString(text) > e.tts.MaxTextLen {
-		slog.Warn("tts: text exceeds max_text_len, skipping synthesis", "len", utf8.RuneCountInString(text), "max", e.tts.MaxTextLen)
-		return
+		return fmt.Errorf("text exceeds max_text_len (%d > %d)", utf8.RuneCountInString(text), e.tts.MaxTextLen)
 	}
-	slog.Info("tts: starting synthesis", "voice", e.tts.Voice, "text_len", len(text))
-	opts := TTSSynthesisOpts{Voice: e.tts.Voice}
-	audioData, format, err := e.tts.TTS.Synthesize(e.ctx, StripMarkdown(text), opts)
-	if err != nil {
-		slog.Error("tts: synthesis failed", "error", err)
-		return
-	}
-	slog.Info("tts: synthesis successful", "format", format, "audio_size", len(audioData))
 	as, ok := p.(AudioSender)
 	if !ok {
-		slog.Warn("tts: platform does not support audio sending", "platform", p.Name())
-		return
+		return fmt.Errorf("platform %s does not support audio sending", p.Name())
 	}
+	slog.Info("tts: starting synthesis", "voice", e.tts.Voice, "speed", e.tts.Speed, "text_len", len(text))
+	opts := TTSSynthesisOpts{
+		Voice:        e.tts.Voice,
+		LanguageType: e.tts.LanguageType,
+		Speed:        e.tts.Speed,
+	}
+	audioData, format, err := e.tts.TTS.Synthesize(e.ctx, StripMarkdown(text), opts)
+	if err != nil {
+		return fmt.Errorf("synthesize: %w", err)
+	}
+	slog.Info("tts: synthesis successful", "format", format, "audio_size", len(audioData))
 	if err := as.SendAudio(e.ctx, replyCtx, audioData, format); err != nil {
-		slog.Error("tts: platform audio send failed", "platform", p.Name(), "error", err)
-		return
+		return fmt.Errorf("send audio: %w", err)
 	}
 	slog.Info("tts: audio sent successfully", "platform", p.Name())
+	return nil
 }
 
 // ──────────────────────────────────────────────────────────────
 // Bot-to-bot relay
 // ──────────────────────────────────────────────────────────────
 
+type platformNameOnly struct {
+	name string
+}
+
+func (p platformNameOnly) Name() string                           { return p.name }
+func (platformNameOnly) Start(MessageHandler) error               { return nil }
+func (platformNameOnly) Reply(context.Context, any, string) error { return nil }
+func (platformNameOnly) Send(context.Context, any, string) error  { return nil }
+func (platformNameOnly) Stop() error                              { return nil }
+
+func relayConversationKey(fromProject, platformName, chatID string) string {
+	return "relay:" + fromProject + ":" + workspaceChannelKey(platformName, chatID)
+}
+
+func (e *Engine) platformForName(name string) Platform {
+	for _, p := range e.platforms {
+		if strings.EqualFold(p.Name(), name) {
+			return p
+		}
+	}
+	return platformNameOnly{name: name}
+}
+
+func (e *Engine) relayContextForSourceSessionKey(fromProject, sourceSessionKey string) (Agent, *SessionManager, string, error) {
+	platformName, chatID, err := parseSessionKeyParts(sourceSessionKey)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("invalid source session key: %w", err)
+	}
+
+	relaySessionKey := relayConversationKey(fromProject, platformName, chatID)
+	if !e.multiWorkspace || e.workspaceBindings == nil {
+		return e.agent, e.sessions, relaySessionKey, nil
+	}
+
+	channelKey := workspaceChannelKey(platformName, chatID)
+	workspace, _, err := e.resolveWorkspace(e.platformForName(platformName), chatID)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("resolve relay workspace: %w", err)
+	}
+	if workspace == "" {
+		if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); b != nil && !usable {
+			return nil, nil, "", fmt.Errorf("workspace binding unavailable for source channel %q", channelKey)
+		}
+		return nil, nil, "", fmt.Errorf("no workspace binding for source channel %q", channelKey)
+	}
+
+	agent, sessions, err := e.getOrCreateWorkspaceAgent(workspace)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("get relay workspace agent: %w", err)
+	}
+	if ws := e.workspacePool.Get(workspace); ws != nil {
+		ws.Touch()
+	}
+	return agent, sessions, relaySessionKey, nil
+}
+
 // HandleRelay processes a relay message synchronously: starts or resumes a
 // dedicated relay session, sends the message to the agent, and blocks until
 // the complete response is collected (or the relay context times out).
-func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message string) (string, error) {
-	relaySessionKey := "relay:" + fromProject + ":" + chatID
-	session := e.sessions.GetOrCreateActive(relaySessionKey)
+func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey, message string) (string, error) {
+	agent, sessions, relaySessionKey, err := e.relayContextForSourceSessionKey(fromProject, sourceSessionKey)
+	if err != nil {
+		return "", err
+	}
+	session := sessions.GetOrCreateActive(relaySessionKey)
 
-	if inj, ok := e.agent.(SessionEnvInjector); ok {
+	if inj, ok := agent.(SessionEnvInjector); ok {
 		envVars := []string{
 			"CC_PROJECT=" + e.name,
-			"CC_SESSION_KEY=" + relaySessionKey,
+			"CC_SESSION_KEY=" + sourceSessionKey,
 		}
 		if exePath, err := os.Executable(); err == nil {
 			binDir := filepath.Dir(exePath)
@@ -13730,31 +13871,44 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 	// Use the engine context (not the relay timeout context) so that the
 	// agent process is not killed when the relay deadline fires. The relay
 	// timeout only controls how long we *wait* for the response.
-	agentSession, err := e.agent.StartSession(e.ctx, session.GetAgentSessionID())
+	agentSession, err := agent.StartSession(e.ctx, session.GetAgentSessionID())
 	if err != nil {
 		// Resume failed — fall back to a fresh session so the relay is not
 		// permanently broken by a corrupted/stale session ID.
 		if session.GetAgentSessionID() != "" {
 			slog.Warn("relay: session resume failed, trying fresh session",
 				"relay_key", relaySessionKey, "error", err)
-			session.SetAgentSessionID("", e.agent.Name())
-			e.sessions.Save()
-			agentSession, err = e.agent.StartSession(e.ctx, "")
+			session.SetAgentSessionID("", agent.Name())
+			sessions.Save()
+			agentSession, err = agent.StartSession(e.ctx, "")
 		}
 		if err != nil {
 			return "", fmt.Errorf("start relay session: %w", err)
 		}
 	}
 
-	if newID := agentSession.CurrentSessionID(); newID != "" {
-		if session.CompareAndSetAgentSessionID(newID, e.agent.Name()) {
-			pendingName := session.GetName()
-			if pendingName != "" && pendingName != "session" && pendingName != "default" {
-				e.sessions.SetSessionName(newID, pendingName)
-			}
-			e.sessions.Save()
+	saveRelaySessionID := func(id string, force bool) {
+		if id == "" {
+			return
 		}
+		changed := false
+		if force {
+			session.SetAgentSessionID(id, agent.Name())
+			changed = true
+		} else {
+			changed = session.CompareAndSetAgentSessionID(id, agent.Name())
+		}
+		if !changed {
+			return
+		}
+		pendingName := session.GetName()
+		if pendingName != "" && pendingName != "session" && pendingName != "default" {
+			sessions.SetSessionName(id, pendingName)
+		}
+		sessions.Save()
 	}
+
+	saveRelaySessionID(agentSession.CurrentSessionID(), false)
 
 	if err := agentSession.Send(message, nil, nil); err != nil {
 		agentSession.Close()
@@ -13769,13 +13923,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 				textParts = append(textParts, event.Content)
 			}
 			if event.SessionID != "" {
-				if session.CompareAndSetAgentSessionID(event.SessionID, e.agent.Name()) {
-					pendingName := session.GetName()
-					if pendingName != "" && pendingName != "session" && pendingName != "default" {
-						e.sessions.SetSessionName(event.SessionID, pendingName)
-					}
-					e.sessions.Save()
-				}
+				saveRelaySessionID(event.SessionID, false)
 			}
 		case EventToolResult:
 			out := strings.TrimSpace(event.Content)
@@ -13792,13 +13940,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 		case EventResult:
 			// Use agentSession.CurrentSessionID() for the same reason as above.
 			if currentID := agentSession.CurrentSessionID(); currentID != "" {
-				if session.CompareAndSetAgentSessionID(currentID, e.agent.Name()) {
-					pendingName := session.GetName()
-					if pendingName != "" && pendingName != "session" && pendingName != "default" {
-						e.sessions.SetSessionName(currentID, pendingName)
-					}
-				}
-				e.sessions.Save()
+				saveRelaySessionID(currentID, true)
 			}
 			resp := event.Content
 			if resp == "" && len(textParts) > 0 {
@@ -13827,7 +13969,7 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, chatID, message s
 			// Relay timed out. Let the agent finish its turn in the
 			// background so the session state is saved cleanly and the
 			// session remains resumable for the next relay call.
-			go e.drainRelaySession(agentSession, session, relaySessionKey)
+			go e.drainRelaySession(agentSession, session, sessions, agent.Name(), relaySessionKey)
 			return relayPartialResponseOrError(ctx.Err(), textParts, fromProject, e.name)
 		}
 	}
@@ -13864,7 +14006,7 @@ func relayPartialResponseOrError(ctxErr error, textParts []string, fromProject, 
 // agent finish its current turn (saving the session ID for future resumption),
 // auto-approves any permission requests, and then closes the session. A 10-minute
 // safety timeout prevents the goroutine from leaking if the agent hangs.
-func (e *Engine) drainRelaySession(agentSession AgentSession, session *Session, relaySessionKey string) {
+func (e *Engine) drainRelaySession(agentSession AgentSession, session *Session, sessions *SessionManager, agentName, relaySessionKey string) {
 	timer := time.NewTimer(10 * time.Minute)
 	defer timer.Stop()
 
@@ -13877,8 +14019,8 @@ func (e *Engine) drainRelaySession(agentSession AgentSession, session *Session, 
 				return
 			}
 			if ev.SessionID != "" {
-				session.SetAgentSessionID(ev.SessionID, e.agent.Name())
-				e.sessions.Save()
+				session.SetAgentSessionID(ev.SessionID, agentName)
+				sessions.Save()
 			}
 			switch ev.Type {
 			case EventResult:
