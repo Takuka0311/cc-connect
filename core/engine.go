@@ -22,12 +22,33 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
 const maxPlatformMessageLen = 4000
 const telegramBotCommandLimit = 100
 const defaultMaxQueuedMessages = 5 // default cap for queued messages per session
+
+// previewText truncates s to maxRunes runes for safe inclusion in debug logs.
+// Truncation uses runes (not bytes) so multi-byte characters render cleanly.
+// Newlines are replaced with literal "\n" to keep each log entry on one line.
+func previewText(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	truncated := false
+	if len(r) > maxRunes {
+		r = r[:maxRunes]
+		truncated = true
+	}
+	out := strings.ReplaceAll(string(r), "\n", "\\n")
+	if truncated {
+		out += "...(truncated)"
+	}
+	return out
+}
 
 const (
 	defaultThinkingMaxLen = 300
@@ -2482,6 +2503,15 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		"content_len", len(msg.Content),
 		"has_images", len(msg.Images) > 0, "has_audio", msg.Audio != nil, "has_files", len(msg.Files) > 0,
 	)
+	// DEBUG: full message content for in-depth debugging (release-gate testing).
+	// Gated behind DEBUG level so production INFO logs don't leak user text.
+	if slog.Default().Enabled(e.ctx, slog.LevelDebug) {
+		slog.Debug("message content",
+			"platform", msg.Platform, "msg_id", msg.MessageID,
+			"session", msg.SessionKey, "user", msg.UserName,
+			"content", previewText(msg.Content, 500),
+		)
+	}
 
 	e.hooks.Emit(HookEvent{
 		Event:      HookEventMessageReceived,
@@ -3151,34 +3181,142 @@ func buildAskQuestionResponse(originalInput map[string]any, questions []UserQues
 	return result
 }
 
-func isApproveAllResponse(s string) bool {
-	for _, w := range []string{
-		"allow all", "allowall", "approve all", "yes all",
+// permissionTokenSeparator reports whether r is a token boundary for
+// permission keyword matching. It splits on Unicode whitespace plus the
+// punctuation users typically write around an @mention or as filler in
+// a chat reply, including full-width / Chinese variants.
+//
+// `@` is intentionally a separator so `@bot 允许` tokenises to
+// ["bot", "允许"] without the keyword swallowing the mention prefix.
+//
+// We deliberately do not split on every Unicode punctuation rune (e.g. `'`
+// inside contractions) — only the ones that show up in real IM messages
+// — so unrelated words stay intact.
+func permissionTokenSeparator(r rune) bool {
+	if unicode.IsSpace(r) {
+		return true
+	}
+	switch r {
+	case '@', '＠',
+		',', '，',
+		'.', '。',
+		'!', '！',
+		'?', '？',
+		':', '：',
+		';', '；',
+		'(', ')', '（', '）',
+		'[', ']', '【', '】',
+		'"', '\'', '“', '”', '‘', '’',
+		'、', '·':
+		return true
+	}
+	return false
+}
+
+// splitPermissionTokens lower-cases s and tokenises it on
+// permissionTokenSeparator boundaries. Returns nil for the empty input
+// so callers can range over it without a length check.
+func splitPermissionTokens(s string) []string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return nil
+	}
+	return strings.FieldsFunc(s, permissionTokenSeparator)
+}
+
+// matchPermissionKeyword reports whether s contains any of the
+// single-token keywords in `keywords`, OR equals any of the
+// multi-token phrases in `phrases` (matched by joining the tokens
+// with a single ASCII space, which canonicalises full-width spacing
+// and adjacent @mentions).
+//
+// Single-token keywords are matched per-token (strict equality on a
+// token boundary) so that "@bot 允许", "允许 @bot", "好的 allow" all
+// match while "禁止允许这种" does NOT (it tokenises to a single
+// 4-character CJK word, no token equals "允许"). Multi-token phrases
+// are matched as a sequence so "@bot 允许 所有" still hits
+// "允许 所有" without falling back to per-token "允许" — this is what
+// keeps `/approve all` distinct from `/allow`.
+func matchPermissionKeyword(s string, phrases []string, keywords []string) bool {
+	tokens := splitPermissionTokens(s)
+	if len(tokens) == 0 {
+		return false
+	}
+	if len(phrases) > 0 {
+		joined := strings.Join(tokens, " ")
+		for _, ph := range phrases {
+			if joined == ph {
+				return true
+			}
+			// Sliding window over tokens to allow extra surrounding
+			// tokens like "@bot allow all please".
+			pTokens := strings.Fields(ph)
+			if len(pTokens) > 1 && len(pTokens) <= len(tokens) {
+				for i := 0; i+len(pTokens) <= len(tokens); i++ {
+					match := true
+					for j, pt := range pTokens {
+						if tokens[i+j] != pt {
+							match = false
+							break
+						}
+					}
+					if match {
+						return true
+					}
+				}
+			}
+		}
+	}
+	for _, tok := range tokens {
+		for _, w := range keywords {
+			if tok == w {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// approveAllPhrases / approveAllSingleTokens / allowKeywords / denyKeywords
+// are the recognised vocabularies for permission responses. Kept as
+// package-level vars so the test suite can assert the exact lists.
+var (
+	approveAllPhrases = []string{
+		"allow all", "approve all", "yes all",
+	}
+	approveAllSingleTokens = []string{
+		"allowall",
 		"允许所有", "允许全部", "全部允许", "所有允许", "都允许", "全部同意",
-	} {
-		if s == w {
-			return true
-		}
 	}
-	return false
+	allowKeywords = []string{
+		"allow", "yes", "y", "ok", "approve",
+		"允许", "同意", "可以", "好", "好的", "是", "确认",
+	}
+	denyKeywords = []string{
+		"deny", "no", "n", "reject", "cancel",
+		"拒绝", "不允许", "不行", "不", "否", "取消",
+	}
+)
+
+// isApproveAllResponse reports whether s expresses "allow all" intent.
+// Multi-token phrases (e.g. "allow all") are matched first; single-token
+// CJK forms (e.g. "允许所有") are matched per-token so a leading or
+// trailing @mention does not break recognition.
+func isApproveAllResponse(s string) bool {
+	return matchPermissionKeyword(s, approveAllPhrases, approveAllSingleTokens)
 }
 
+// isAllowResponse reports whether s expresses an "allow" intent.
+// Tokenised so that group-chat replies like "@产品经理 允许" still match
+// — see internal task t-20260614-ayc85z.
 func isAllowResponse(s string) bool {
-	for _, w := range []string{"allow", "yes", "y", "ok", "允许", "同意", "可以", "好", "好的", "是", "确认", "approve"} {
-		if s == w {
-			return true
-		}
-	}
-	return false
+	return matchPermissionKeyword(s, nil, allowKeywords)
 }
 
+// isDenyResponse reports whether s expresses a "deny" intent.
+// Tokenised so that group-chat replies like "@产品经理 拒绝" still match.
 func isDenyResponse(s string) bool {
-	for _, w := range []string{"deny", "no", "n", "reject", "拒绝", "不允许", "不行", "不", "否", "取消", "cancel"} {
-		if s == w {
-			return true
-		}
-	}
-	return false
+	return matchPermissionKeyword(s, nil, denyKeywords)
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -3213,6 +3351,10 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 
 	e.i18n.DetectAndSet(msg.Content)
 	session.AddHistory("user", msg.Content)
+	// Persist user message immediately so crashes between user input and
+	// assistant reply don't lose it (the assistant-side Save below depends
+	// on the turn completing without a process crash).
+	sessions.Save()
 
 	// Use the agent override when available (multi-workspace mode)
 	var agentOverride Agent
@@ -3555,6 +3697,15 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		e.interactiveStates[sessionKey] = state
 		return state
 	}
+
+	// Restore the agent's active provider from the session before starting a
+	// new sub-process. The provider choice is persisted to disk by
+	// `/provider switch`; without restoring it here, a cc-connect process
+	// restart silently drops the user's choice while keeping the resumed
+	// agent_session_id, producing "model X does not exist" errors when
+	// the model name is sent to the wrong base_url
+	// (cc-connect internal task t-20260614-qp7xnl).
+	restoreActiveProviderFromSession(agent, session)
 
 	// Resume only when we have a concrete saved agent session ID. If the session
 	// is unbound, force a fresh start instead of attaching to whichever CLI
@@ -4962,6 +5113,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				"output_tokens", event.OutputTokens,
 				"silent", isSilent,
 			)
+			// DEBUG: full assistant response for in-depth debugging.
+			if slog.Default().Enabled(e.ctx, slog.LevelDebug) {
+				slog.Debug("turn response",
+					"session", session.ID,
+					"agent_session", session.GetAgentSessionID(),
+					"history_len", session.HistoryLen(),
+					"response", previewText(fullResponse, 500),
+				)
+			}
 
 			e.noteUserTurnCompleted(state)
 
@@ -5265,6 +5425,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 
 				session.AddHistory("user", queued.content)
+				// Persist queued user message immediately (mirror of the
+				// initial AddHistory("user",...) save above).
+				sessions.Save()
 
 				if idleTimer != nil {
 					if !idleTimer.Stop() {
@@ -5358,6 +5521,10 @@ channelClosed:
 
 		fullResponse := strings.Join(textParts, "")
 		session.AddHistory("assistant", fullResponse)
+		// Persist immediately — this path runs on abnormal channel close,
+		// so deferring the save until the next foreground turn risks losing
+		// the partial assistant response if the process exits next.
+		sessions.Save()
 
 		// Respect NO_REPLY even on abnormal exit so silent turns stay silent.
 		if isSilentReply(fullResponse) {
@@ -6289,8 +6456,13 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	e.cleanupInteractiveState(interactiveKey)
 	slog.Info("cmdSwitch: cleanup done", "session_key", msg.SessionKey)
 
-	session := sessions.SwitchToAgentSession(msg.SessionKey, matched.ID, agent.Name(), matched.Summary)
-	session.ClearHistory()
+	// NOTE: Do NOT call session.ClearHistory() on the returned Session.
+	// When switching back to a known agent_session_id, SwitchToAgentSession
+	// returns the *existing* Session object whose History reflects the
+	// original conversation; wiping it makes /history return empty after a
+	// /switch round-trip. When SwitchToAgentSession creates a fresh Session
+	// (no prior match), History is already nil, so preserving is a no-op.
+	_ = sessions.SwitchToAgentSession(msg.SessionKey, matched.ID, agent.Name(), matched.Summary)
 
 	shortID := matched.ID
 	if len(shortID) > 12 {
@@ -9724,6 +9896,7 @@ func (e *Engine) cmdProvider(p Platform, msg *Message, args []string) {
 			s := sessions.GetOrCreateActive(msg.SessionKey)
 			s.SetAgentSessionID("", "")
 			s.ClearHistory()
+			s.SetActiveProvider("")
 			sessions.Save()
 		}
 		// Only persist to global config when operating on the global agent;
@@ -9888,6 +10061,13 @@ func (e *Engine) switchProvider(p Platform, msg *Message, sessions *SessionManag
 	s := sessions.GetOrCreateActive(msg.SessionKey)
 	s.SetAgentSessionID("", "")
 	s.ClearHistory()
+	// Persist the provider choice so that a subsequent --resume after a
+	// cc-connect process restart can re-bind the agent's activeIdx; without
+	// this the agent reverts to its default provider while the saved
+	// agent_session_id keeps the conversation going, producing "model X
+	// does not exist" errors against the wrong base_url. See cc-connect
+	// internal task t-20260614-qp7xnl.
+	s.SetActiveProvider(name)
 	sessions.Save()
 
 	// Only persist to global config when operating on the global agent;
@@ -10192,6 +10372,119 @@ func (e *Engine) SendTTSToSession(sessionKey, text string) error {
 		return err
 	}
 	return e.synthesizeAndSendTTS(p, replyCtx, text)
+}
+
+// SendAudiosToSession routes outbound audio attachments to the
+// platform's AudioSender (native voice bubble + transcoding) when
+// supported, falling back to FileSender otherwise. Used by
+// `cc-connect send --audio`. Mirrors SendToSessionWithAttachments for
+// audio-typed clips so they don't get dispatched as generic files.
+func (e *Engine) SendAudiosToSession(sessionKey string, audios []FileAttachment) error {
+	if len(audios) == 0 {
+		return nil
+	}
+	_, p, replyCtx, err := e.resolveOutboundSessionTarget(sessionKey, true)
+	if err != nil {
+		return err
+	}
+	if !e.attachmentSendEnabled {
+		return ErrAttachmentSendDisabled
+	}
+
+	audioSender, audioOK := p.(AudioSender)
+	fileSender, fileOK := p.(FileSender)
+	if !audioOK && !fileOK {
+		return fmt.Errorf("platform %s: %w", p.Name(), ErrNotSupported)
+	}
+
+	for _, a := range audios {
+		if err := e.waitOutgoing(p); err != nil {
+			return err
+		}
+		format := audioFormatHint(a)
+		if audioOK {
+			if err := audioSender.SendAudio(e.ctx, replyCtx, a.Data, format); err != nil {
+				return err
+			}
+			continue
+		}
+		// Fallback: platform has no AudioSender. Send as a plain file so
+		// the user still receives the clip — but warn so operators know
+		// the native voice bubble was unavailable.
+		slog.Warn("send: platform has no AudioSender, falling back to SendFile",
+			"platform", p.Name(), "file_name", a.FileName, "format", format)
+		if err := fileSender.SendFile(e.ctx, replyCtx, a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SendVideosToSession routes outbound video attachments to the
+// platform's VideoSender (native video bubble) when supported, falling
+// back to FileSender otherwise. Used by `cc-connect send --video`.
+func (e *Engine) SendVideosToSession(sessionKey string, videos []FileAttachment) error {
+	if len(videos) == 0 {
+		return nil
+	}
+	_, p, replyCtx, err := e.resolveOutboundSessionTarget(sessionKey, true)
+	if err != nil {
+		return err
+	}
+	if !e.attachmentSendEnabled {
+		return ErrAttachmentSendDisabled
+	}
+
+	videoSender, videoOK := p.(VideoSender)
+	fileSender, fileOK := p.(FileSender)
+	if !videoOK && !fileOK {
+		return fmt.Errorf("platform %s: %w", p.Name(), ErrNotSupported)
+	}
+
+	for _, v := range videos {
+		if err := e.waitOutgoing(p); err != nil {
+			return err
+		}
+		format := videoFormatHint(v)
+		if videoOK {
+			if err := videoSender.SendVideo(e.ctx, replyCtx, v.Data, format, v.FileName); err != nil {
+				return err
+			}
+			continue
+		}
+		slog.Warn("send: platform has no VideoSender, falling back to SendFile",
+			"platform", p.Name(), "file_name", v.FileName, "format", format)
+		if err := fileSender.SendFile(e.ctx, replyCtx, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// audioFormatHint extracts the short format hint (e.g. "mp3", "opus")
+// from a FileAttachment. Filename extension wins over MIME type because
+// the CLI-uploaded name is more reliable than detected MIME (raw
+// audio bytes often sniff to application/octet-stream).
+func audioFormatHint(a FileAttachment) string {
+	if ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(a.FileName), ".")); ext != "" {
+		return ext
+	}
+	if a.MimeType != "" {
+		// "audio/mpeg" -> "mpeg"; "audio/ogg; codecs=opus" -> "ogg"
+		mt := strings.ToLower(a.MimeType)
+		if i := strings.Index(mt, ";"); i >= 0 {
+			mt = mt[:i]
+		}
+		if i := strings.Index(mt, "/"); i >= 0 {
+			return strings.TrimSpace(mt[i+1:])
+		}
+	}
+	return ""
+}
+
+// videoFormatHint mirrors audioFormatHint for video clips.
+func videoFormatHint(v FileAttachment) string {
+	return audioFormatHint(v)
 }
 
 func (e *Engine) resolveOutboundSessionTarget(sessionKey string, hasAttachments bool) (*interactiveState, Platform, any, error) {
@@ -15585,4 +15878,41 @@ func (e *Engine) cmdWebStatus(p Platform, msg *Message) {
 		return
 	}
 	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgWebStatus), url))
+}
+
+// restoreActiveProviderFromSession syncs the agent's active provider to the
+// one persisted in the session, but only when the choice survived a
+// cc-connect process restart (i.e. the in-memory active provider is not
+// already the desired one). It is a no-op when:
+//   - the agent does not implement ProviderSwitcher,
+//   - the session never recorded a provider choice (`/provider switch` was
+//     never called for this conversation), or
+//   - the agent already has the correct provider active (steady-state path
+//     within a single process lifetime).
+//
+// The empty-session-value case is intentionally a no-op rather than
+// `SetActiveProvider("")`: clearing the agent here would clobber a
+// project-level default for sessions that predate this field.
+func restoreActiveProviderFromSession(agent Agent, session *Session) {
+	if agent == nil || session == nil {
+		return
+	}
+	want := session.GetActiveProvider()
+	if want == "" {
+		return
+	}
+	ps, ok := agent.(ProviderSwitcher)
+	if !ok {
+		return
+	}
+	if cur := ps.GetActiveProvider(); cur != nil && cur.Name == want {
+		return
+	}
+	if !ps.SetActiveProvider(want) {
+		slog.Warn("session.active_provider no longer registered; leaving agent default",
+			"session_id", session.ID, "wanted_provider", want)
+		return
+	}
+	slog.Info("restored active provider from session",
+		"session_id", session.ID, "provider", want)
 }

@@ -5375,6 +5375,120 @@ func TestSwitchProvider_MultiWorkspaceUsesWorkspaceSessions(t *testing.T) {
 	}
 }
 
+// TestSwitchProvider_PersistsToSession verifies that `/provider switch <name>`
+// records the choice on the Session so it survives a cc-connect process
+// restart. Without this, the agent_session_id keeps the conversation alive
+// while the in-memory active provider reverts to default — see internal
+// task t-20260614-qp7xnl.
+func TestSwitchProvider_PersistsToSession(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubProviderAgent{
+		providers: []ProviderConfig{{Name: "default-prov"}, {Name: "minimax"}},
+		active:    "default-prov",
+	}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	s.SetAgentSessionID("agent-sess-1", "test")
+
+	e.cmdProvider(p, msg, []string{"switch", "minimax"})
+
+	if got := s.GetActiveProvider(); got != "minimax" {
+		t.Fatalf("session.ActiveProvider = %q, want %q", got, "minimax")
+	}
+	// switchProvider should also clear the agent_session_id (existing behavior).
+	if got := s.GetAgentSessionID(); got != "" {
+		t.Fatalf("session.AgentSessionID = %q, want cleared", got)
+	}
+}
+
+// TestProviderClear_ClearsSessionActiveProvider verifies `/provider clear`
+// also wipes the persisted choice so the next session starts with the
+// agent's default provider again.
+func TestProviderClear_ClearsSessionActiveProvider(t *testing.T) {
+	p := &stubPlatformEngine{n: "plain"}
+	agent := &stubProviderAgent{
+		providers: []ProviderConfig{{Name: "default-prov"}, {Name: "minimax"}},
+		active:    "minimax",
+	}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+	s := e.sessions.GetOrCreateActive(msg.SessionKey)
+	s.SetActiveProvider("minimax")
+
+	e.cmdProvider(p, msg, []string{"clear"})
+
+	if got := s.GetActiveProvider(); got != "" {
+		t.Fatalf("after clear: session.ActiveProvider = %q, want empty", got)
+	}
+}
+
+// TestRestoreActiveProviderFromSession_AllPaths exercises every branch of the
+// restore helper: agent without ProviderSwitcher, empty session value, agent
+// already on the right provider (no-op), missing provider name (graceful
+// warning), and the happy path that fixes t-20260614-qp7xnl.
+func TestRestoreActiveProviderFromSession_AllPaths(t *testing.T) {
+	t.Run("agent without ProviderSwitcher is a no-op", func(t *testing.T) {
+		// stubAgent does not implement ProviderSwitcher.
+		s := &Session{ID: "s1", ActiveProvider: "minimax"}
+		// Must not panic.
+		restoreActiveProviderFromSession(&stubAgent{}, s)
+	})
+
+	t.Run("empty session.ActiveProvider leaves agent untouched", func(t *testing.T) {
+		agent := &stubProviderAgent{
+			providers: []ProviderConfig{{Name: "a"}, {Name: "b"}},
+			active:    "a",
+		}
+		s := &Session{ID: "s2"}
+		restoreActiveProviderFromSession(agent, s)
+		if agent.active != "a" {
+			t.Fatalf("agent.active = %q, want %q (untouched)", agent.active, "a")
+		}
+	})
+
+	t.Run("steady state: agent already on the right provider is a no-op", func(t *testing.T) {
+		agent := &stubProviderAgent{
+			providers: []ProviderConfig{{Name: "a"}, {Name: "b"}},
+			active:    "b",
+		}
+		s := &Session{ID: "s3", ActiveProvider: "b"}
+		restoreActiveProviderFromSession(agent, s)
+		if agent.active != "b" {
+			t.Fatalf("agent.active = %q, want %q", agent.active, "b")
+		}
+	})
+
+	t.Run("missing provider name is a graceful warning, not a panic", func(t *testing.T) {
+		agent := &stubProviderAgent{
+			providers: []ProviderConfig{{Name: "a"}},
+			active:    "a",
+		}
+		s := &Session{ID: "s4", ActiveProvider: "no-longer-exists"}
+		restoreActiveProviderFromSession(agent, s)
+		if agent.active != "a" {
+			t.Fatalf("agent.active = %q, want %q (unchanged on unknown provider)", agent.active, "a")
+		}
+	})
+
+	t.Run("post-restart restore: agent is rebound to the persisted provider", func(t *testing.T) {
+		// Simulates the t-20260614-qp7xnl scenario: process restarted, so
+		// in-memory activeIdx is at the default ("a"), but the session
+		// recorded that the user previously switched to "minimax".
+		agent := &stubProviderAgent{
+			providers: []ProviderConfig{{Name: "a"}, {Name: "minimax"}},
+			active:    "a",
+		}
+		s := &Session{ID: "s5", ActiveProvider: "minimax"}
+		restoreActiveProviderFromSession(agent, s)
+		if agent.active != "minimax" {
+			t.Fatalf("agent.active = %q, want %q (restored from session)", agent.active, "minimax")
+		}
+	})
+}
+
 func TestCmdMode_UsesInlineButtonsOnButtonOnlyPlatform(t *testing.T) {
 	p := &stubInlineButtonPlatform{stubPlatformEngine: stubPlatformEngine{n: "inline-only"}}
 	agent := &stubModelModeAgent{}
@@ -14325,4 +14439,423 @@ func TestHandlePendingPermission_StalePermissionCallback_Dropped(t *testing.T) {
 			t.Fatalf("RespondPermission behavior = %q, want allow", rec.lastResult.Behavior)
 		}
 	})
+}
+
+// ─── Permission keyword tokenization (t-20260614-ayc85z) ────────────────
+// Group-chat platforms (wecom in particular) require the user to
+// @mention the bot for the message to reach cc-connect, so permission
+// replies arrive as "@bot 允许" / "允许 @bot" / etc. rather than the
+// bare keyword. The matchers must tolerate the surrounding mention
+// without losing word-boundary discipline (e.g. must NOT match
+// "禁止允许这种" — the keyword is embedded inside another CJK word).
+
+func TestIsAllowResponse_WithLeadingMention(t *testing.T) {
+	cases := []string{
+		"@产品经理 允许",
+		"@bot 允许",
+		"@bot allow",
+		"@bot ok",
+		"@产品经理 同意",
+	}
+	for _, s := range cases {
+		if !isAllowResponse(strings.ToLower(s)) {
+			t.Errorf("isAllowResponse(%q) = false, want true", s)
+		}
+	}
+}
+
+func TestIsAllowResponse_WithTrailingMention(t *testing.T) {
+	cases := []string{
+		"允许 @产品经理",
+		"allow @bot",
+		"好的 @bot",
+		"yes @bot",
+	}
+	for _, s := range cases {
+		if !isAllowResponse(strings.ToLower(s)) {
+			t.Errorf("isAllowResponse(%q) = false, want true", s)
+		}
+	}
+}
+
+func TestIsAllowResponse_WithMultipleMentions(t *testing.T) {
+	cases := []string{
+		"@a @b 允许",
+		"@a allow @b",
+		"hey @bot 好的, @user2",
+	}
+	for _, s := range cases {
+		if !isAllowResponse(strings.ToLower(s)) {
+			t.Errorf("isAllowResponse(%q) = false, want true", s)
+		}
+	}
+}
+
+// TestIsAllowResponse_NotInsideOtherWord locks the false-positive
+// boundary: a keyword embedded inside a longer CJK string must NOT
+// match. This is what distinguishes token-level matching from naive
+// substring contains.
+func TestIsAllowResponse_NotInsideOtherWord(t *testing.T) {
+	cases := []string{
+		"禁止允许这种",
+		"不允许这样",   // "不允许" has its own deny entry, but as part of "不允许这样" the user clearly is denying / negating, never allowing.
+		"我不太允许这件事", // long sentence, no token equals "允许"
+		"please don't allowall the things", // FieldsFunc keeps "allowall" intact, but it is the approveAll single-token form, not allow.
+		"hello world",
+		"",
+	}
+	for _, s := range cases {
+		if isAllowResponse(strings.ToLower(s)) {
+			t.Errorf("isAllowResponse(%q) = true, want false (no token equals an allow keyword)", s)
+		}
+	}
+}
+
+func TestIsDenyResponse_WithMention(t *testing.T) {
+	cases := []string{
+		"@产品经理 拒绝",
+		"@bot deny",
+		"拒绝 @bot",
+		"@bot reject",
+		"@bot 不允许",
+		"@bot cancel",
+	}
+	for _, s := range cases {
+		if !isDenyResponse(strings.ToLower(s)) {
+			t.Errorf("isDenyResponse(%q) = false, want true", s)
+		}
+	}
+
+	negatives := []string{
+		"拒绝症患者",       // embedded — must not match
+		"我们都不应该 hello", // unrelated
+	}
+	for _, s := range negatives {
+		if isDenyResponse(strings.ToLower(s)) {
+			t.Errorf("isDenyResponse(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestIsApproveAllResponse_MultiWordWithMention(t *testing.T) {
+	cases := []string{
+		"@bot 允许所有",
+		"@bot allow all",
+		"allow all @bot",
+		"@产品经理 允许全部",
+		"hey please allow all things @bot", // sliding-window phrase match
+		"全部允许",
+	}
+	for _, s := range cases {
+		if !isApproveAllResponse(strings.ToLower(s)) {
+			t.Errorf("isApproveAllResponse(%q) = false, want true", s)
+		}
+	}
+
+	// Single allow keyword alone must not be approve-all.
+	negatives := []string{
+		"@bot 允许",
+		"allow",
+		"yes",
+		"",
+	}
+	for _, s := range negatives {
+		if isApproveAllResponse(strings.ToLower(s)) {
+			t.Errorf("isApproveAllResponse(%q) = true, want false (single allow is not approve-all)", s)
+		}
+	}
+}
+
+// TestHandlePendingPermission_AllowWithMention is the integration
+// regression for the wecom group bug: a real Bash permission request is
+// pending, and the user replies with "@产品经理 允许" exactly as wecom
+// delivers it. Before the fix this fell through to the "still waiting"
+// branch and the agent never advanced.
+func TestHandlePendingPermission_AllowWithMention(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+
+	iKey := "wecom:group:user1"
+	pending := &pendingPermission{
+		RequestID: "req-bash-1",
+		ToolName:  "Bash",
+		ToolInput: map[string]any{"command": "cat /etc/passwd"},
+		Resolved:  make(chan struct{}),
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[iKey] = &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending:      pending,
+	}
+	e.interactiveMu.Unlock()
+
+	msg := &Message{
+		SessionKey: "wecom:group:user1",
+		UserID:     "user1",
+		Content:    "@产品经理 允许",
+		ReplyCtx:   "ctx",
+	}
+	if !e.handlePendingPermission(p, msg, "@产品经理 允许", iKey) {
+		t.Fatal("handlePendingPermission returned false, want true")
+	}
+	if rec.calls != 1 {
+		t.Fatalf("RespondPermission calls = %d, want 1", rec.calls)
+	}
+	if rec.lastID != "req-bash-1" {
+		t.Fatalf("RespondPermission id = %q, want req-bash-1", rec.lastID)
+	}
+	if rec.lastResult.Behavior != "allow" {
+		t.Fatalf("RespondPermission behavior = %q, want allow", rec.lastResult.Behavior)
+	}
+}
+
+// TestHandlePendingPermission_ApproveAllWithMention covers the same
+// path for the approve-all phrase — must beat the per-token allow
+// match because handlePendingPermission checks isApproveAllResponse
+// first.
+func TestHandlePendingPermission_ApproveAllWithMention(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+
+	iKey := "wecom:group:user2"
+	pending := &pendingPermission{
+		RequestID: "req-bash-2",
+		ToolName:  "Bash",
+		ToolInput: map[string]any{"command": "rm -rf /tmp/x"},
+		Resolved:  make(chan struct{}),
+	}
+	state := &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending:      pending,
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[iKey] = state
+	e.interactiveMu.Unlock()
+
+	msg := &Message{
+		SessionKey: "wecom:group:user2",
+		UserID:     "user2",
+		Content:    "@产品经理 允许所有",
+		ReplyCtx:   "ctx",
+	}
+	if !e.handlePendingPermission(p, msg, "@产品经理 允许所有", iKey) {
+		t.Fatal("handlePendingPermission returned false, want true")
+	}
+	if rec.calls != 1 {
+		t.Fatalf("RespondPermission calls = %d, want 1", rec.calls)
+	}
+	if rec.lastResult.Behavior != "allow" {
+		t.Fatalf("RespondPermission behavior = %q, want allow", rec.lastResult.Behavior)
+	}
+	state.mu.Lock()
+	approveAll := state.approveAll
+	state.mu.Unlock()
+	if !approveAll {
+		t.Fatal("state.approveAll = false, want true (approve-all must persist for follow-up tools)")
+	}
+}
+
+// ─── Audio / Video routing (t-20260615-cqjbk1) ────────────────────────
+// `cc-connect send --audio` / `--video` must reach AudioSender /
+// VideoSender — NOT SendFile. PR #1202 made the CLI flags exist but
+// silently routed clips through SendFile, defeating the
+// transcoding-and-render-as-native-bubble pipeline.
+
+// audioVideoStubPlatform implements both AudioSender and VideoSender
+// alongside the file-fallback path so we can assert the engine picks
+// the dedicated method.
+type audioVideoStubPlatform struct {
+	stubMediaPlatform
+	mu     sync.Mutex
+	audios []audioCall
+	videos []videoCall
+}
+
+type audioCall struct {
+	data   []byte
+	format string
+}
+
+type videoCall struct {
+	data     []byte
+	format   string
+	fileName string
+}
+
+func (p *audioVideoStubPlatform) SendAudio(_ context.Context, _ any, audio []byte, format string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.audios = append(p.audios, audioCall{data: append([]byte(nil), audio...), format: format})
+	return nil
+}
+
+func (p *audioVideoStubPlatform) SendVideo(_ context.Context, _ any, video []byte, format string, fileName string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.videos = append(p.videos, videoCall{data: append([]byte(nil), video...), format: format, fileName: fileName})
+	return nil
+}
+
+func TestSendAudiosToSession_RoutesToSendAudio_NotSendFile(t *testing.T) {
+	p := &audioVideoStubPlatform{stubMediaPlatform: stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.interactiveStates["session-audio"] = &interactiveState{platform: p, replyCtx: "ctx"}
+
+	err := e.SendAudiosToSession("session-audio", []FileAttachment{
+		{MimeType: "audio/mpeg", Data: []byte("mp3-bytes"), FileName: "clip.mp3"},
+		{MimeType: "audio/ogg", Data: []byte("opus-bytes"), FileName: "voice.opus"},
+	})
+	if err != nil {
+		t.Fatalf("SendAudiosToSession returned error: %v", err)
+	}
+	if got := len(p.audios); got != 2 {
+		t.Fatalf("AudioSender.SendAudio called %d times, want 2", got)
+	}
+	if p.audios[0].format != "mp3" {
+		t.Errorf("audio[0].format = %q, want %q (filename ext wins)", p.audios[0].format, "mp3")
+	}
+	if p.audios[1].format != "opus" {
+		t.Errorf("audio[1].format = %q, want %q", p.audios[1].format, "opus")
+	}
+	if string(p.audios[0].data) != "mp3-bytes" {
+		t.Errorf("audio[0].data = %q, want %q", p.audios[0].data, "mp3-bytes")
+	}
+	// Crucial: must NOT have hit SendFile.
+	if len(p.files) != 0 {
+		t.Errorf("SendFile called %d times, want 0 (audio must not fall back when AudioSender exists)", len(p.files))
+	}
+}
+
+func TestSendAudiosToSession_PlatformWithoutAudioSender_FallsBackToFile(t *testing.T) {
+	// stubMediaPlatform implements ImageSender + FileSender but NOT AudioSender.
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "no-audio"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.interactiveStates["session-fallback"] = &interactiveState{platform: p, replyCtx: "ctx"}
+
+	err := e.SendAudiosToSession("session-fallback", []FileAttachment{
+		{MimeType: "audio/mpeg", Data: []byte("mp3-bytes"), FileName: "clip.mp3"},
+	})
+	if err != nil {
+		t.Fatalf("SendAudiosToSession returned error: %v", err)
+	}
+	if len(p.files) != 1 {
+		t.Fatalf("expected fallback SendFile call, got %d", len(p.files))
+	}
+	if p.files[0].FileName != "clip.mp3" {
+		t.Errorf("fallback file name = %q, want clip.mp3", p.files[0].FileName)
+	}
+}
+
+func TestSendAudiosToSession_PlatformWithNeitherSender_Errors(t *testing.T) {
+	p := &stubPlatformEngine{n: "text-only"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.interactiveStates["session-none"] = &interactiveState{platform: p, replyCtx: "ctx"}
+
+	err := e.SendAudiosToSession("session-none", []FileAttachment{
+		{MimeType: "audio/mpeg", Data: []byte("x"), FileName: "x.mp3"},
+	})
+	if err == nil {
+		t.Fatal("expected error when platform has neither AudioSender nor FileSender")
+	}
+	if !errors.Is(err, ErrNotSupported) {
+		t.Fatalf("err = %v, want ErrNotSupported", err)
+	}
+}
+
+func TestSendAudiosToSession_DisabledByConfig(t *testing.T) {
+	p := &audioVideoStubPlatform{stubMediaPlatform: stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetAttachmentSendEnabled(false)
+	e.interactiveStates["session-audio-off"] = &interactiveState{platform: p, replyCtx: "ctx"}
+
+	err := e.SendAudiosToSession("session-audio-off", []FileAttachment{
+		{MimeType: "audio/mpeg", Data: []byte("x"), FileName: "x.mp3"},
+	})
+	if !errors.Is(err, ErrAttachmentSendDisabled) {
+		t.Fatalf("err = %v, want ErrAttachmentSendDisabled", err)
+	}
+	if len(p.audios) != 0 {
+		t.Errorf("audios sent while disabled: %d, want 0", len(p.audios))
+	}
+}
+
+func TestSendVideosToSession_RoutesToSendVideo_NotSendFile(t *testing.T) {
+	p := &audioVideoStubPlatform{stubMediaPlatform: stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.interactiveStates["session-video"] = &interactiveState{platform: p, replyCtx: "ctx"}
+
+	err := e.SendVideosToSession("session-video", []FileAttachment{
+		{MimeType: "video/mp4", Data: []byte("mp4-bytes"), FileName: "demo.mp4"},
+	})
+	if err != nil {
+		t.Fatalf("SendVideosToSession returned error: %v", err)
+	}
+	if len(p.videos) != 1 {
+		t.Fatalf("VideoSender.SendVideo called %d times, want 1", len(p.videos))
+	}
+	if p.videos[0].format != "mp4" {
+		t.Errorf("video[0].format = %q, want mp4", p.videos[0].format)
+	}
+	if p.videos[0].fileName != "demo.mp4" {
+		t.Errorf("video[0].fileName = %q, want demo.mp4", p.videos[0].fileName)
+	}
+	if len(p.files) != 0 {
+		t.Errorf("SendFile called %d times, want 0 (video must not fall back when VideoSender exists)", len(p.files))
+	}
+}
+
+func TestSendVideosToSession_PlatformWithoutVideoSender_FallsBackToFile(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "no-video"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.interactiveStates["session-vfb"] = &interactiveState{platform: p, replyCtx: "ctx"}
+
+	err := e.SendVideosToSession("session-vfb", []FileAttachment{
+		{MimeType: "video/mp4", Data: []byte("mp4"), FileName: "demo.mp4"},
+	})
+	if err != nil {
+		t.Fatalf("SendVideosToSession returned error: %v", err)
+	}
+	if len(p.files) != 1 {
+		t.Fatalf("expected fallback SendFile call, got %d", len(p.files))
+	}
+}
+
+func TestAudioFormatHint(t *testing.T) {
+	cases := []struct {
+		name string
+		in   FileAttachment
+		want string
+	}{
+		{"filename ext wins", FileAttachment{FileName: "voice.OPUS", MimeType: "application/octet-stream"}, "opus"},
+		{"mime fallback", FileAttachment{FileName: "blob", MimeType: "audio/mpeg"}, "mpeg"},
+		{"mime with codecs", FileAttachment{FileName: "blob", MimeType: "audio/ogg; codecs=opus"}, "ogg"},
+		{"empty", FileAttachment{}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := audioFormatHint(tc.in); got != tc.want {
+				t.Errorf("audioFormatHint(%+v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAgentSystemPrompt_DocumentsAudioVideoFlags(t *testing.T) {
+	prompt := AgentSystemPrompt()
+	for _, want := range []string{"send --audio", "send --video"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("AgentSystemPrompt missing %q", want)
+		}
+	}
+	// Make sure the surrounding guidance is also present so the agent
+	// doesn't silently downgrade --audio/--video to --file.
+	if !strings.Contains(prompt, "Do NOT downgrade") {
+		t.Error("AgentSystemPrompt missing the 'Do NOT downgrade' anti-regression line")
+	}
 }
