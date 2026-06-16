@@ -1087,6 +1087,78 @@ func TestProcessInteractiveEvents_DoesNotSuppressDifferentFinalText(t *testing.T
 	}
 }
 
+// TestProcessInteractiveEvents_NonTerminalResultContinuesTurn pins issue #481:
+// when Claude Code emits a mid-turn compaction result (Done=false), the engine
+// must NOT treat it as turn completion. Subsequent EventText (analogous to a
+// post-compaction assistant chunk) must still be observed, and the final
+// EventResult{Done:true} is the one that finalizes the turn
+// (noteUserTurnCompleted called exactly once, fullResponse sent).
+func TestProcessInteractiveEvents_NonTerminalResultContinuesTurn(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "test:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession:                  agentSession,
+		platform:                      p,
+		replyCtx:                      "ctx-1",
+		currentTurnUserMessageTimeMs:  100,
+		lastCompletedUserMessageTimeMs: 0,
+	}
+	e.interactiveStates[sessionKey] = state
+
+	// Mid-turn compaction event: agent emits type:"result" with Done=false
+	// when it triggers automatic context compaction. Content is empty.
+	agentSession.events <- Event{
+		Type:        EventResult,
+		Content:     "",
+		Done:        false,
+		InputTokens: 50000,
+		Metadata:    map[string]any{"compaction_continue": true},
+	}
+
+	// Post-compaction assistant chunk: must still be observed by the engine
+	// loop (not dropped by an early return). We don't depend on tool-rendering
+	// state for the regression contract — the fact that the loop processes
+	// this event proves it kept running past the compaction event.
+	agentSession.events <- Event{Type: EventText, Content: "after-compact-"}
+
+	// Final terminal result.
+	finalText := "turn done after compaction"
+	agentSession.events <- Event{
+		Type:    EventResult,
+		Content: finalText,
+		Done:    true,
+	}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+
+	// noteUserTurnCompleted must have been called exactly once on the
+	// terminal result, advancing the watermark to the in-flight message time.
+	state.mu.Lock()
+	gotCompleted := state.lastCompletedUserMessageTimeMs
+	state.mu.Unlock()
+	if gotCompleted != 100 {
+		t.Fatalf("lastCompletedUserMessageTimeMs = %d, want 100 (noteUserTurnCompleted should run exactly once on terminal result)", gotCompleted)
+	}
+
+	// The final text must have been sent to the platform. The compaction
+	// event must NOT have produced an empty reply.
+	sent := p.getSent()
+	if len(sent) == 0 {
+		t.Fatalf("no message sent; want at least the final reply %q", finalText)
+	}
+	if sent[len(sent)-1] != finalText {
+		t.Fatalf("last sent = %q, want %q (compaction empty reply must not leak, final reply must arrive)", sent[len(sent)-1], finalText)
+	}
+	for i, msg := range sent {
+		if msg == "" {
+			t.Fatalf("sent[%d] is empty — compaction must not produce an empty message; all sent=%v", i, sent)
+		}
+	}
+}
+
 func TestProcessInteractiveEvents_AppendsReplyFooterWhenEnabled(t *testing.T) {
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
@@ -6640,6 +6712,62 @@ func TestHandlePendingPermission_AskUserQuestion_SkipsPermFlow(t *testing.T) {
 	}
 }
 
+// TestHandlePendingPermission_CronFallback verifies that the fallback path
+// in handlePendingPermission can locate a pending permission stored under a
+// cron composite key ("sessionKey#cron:sid") when the callback uses the
+// plain sessionKey.
+func TestHandlePendingPermission_CronFallback(t *testing.T) {
+	e := newTestEngine()
+	p := &stubPlatformEngine{n: "test"}
+	rec := &recordingAgentSession{}
+
+	cronKey := "test:chat:user1#cron:sid123"
+
+	e.interactiveMu.Lock()
+	e.interactiveStates[cronKey] = &interactiveState{
+		agentSession: rec,
+		platform:     p,
+		replyCtx:     "ctx",
+		pending: &pendingPermission{
+			RequestID: "req-1",
+			ToolInput: map[string]any{"path": "/tmp/x"},
+			Resolved:  make(chan struct{}),
+		},
+	}
+	e.interactiveMu.Unlock()
+
+	// Callback uses only the plain sessionKey, not the composite cron key
+	msg := &Message{SessionKey: "test:chat:user1", ReplyCtx: "ctx"}
+
+	if !e.handlePendingPermission(p, msg, "allow", "") {
+		t.Fatal("expected pending permission to be handled via cron fallback")
+	}
+
+	// Verify the cron state was updated, not some other state
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[cronKey]
+	e.interactiveMu.Unlock()
+	if state == nil {
+		t.Fatal("expected cron interactive state to remain")
+	}
+	state.mu.Lock()
+	hasPending := state.pending != nil
+	state.mu.Unlock()
+	if hasPending {
+		t.Fatal("expected pending permission to be cleared")
+	}
+
+	if rec.calls != 1 {
+		t.Fatalf("RespondPermission calls = %d, want 1", rec.calls)
+	}
+	if rec.lastID != "req-1" {
+		t.Fatalf("RespondPermission id = %q, want %q", rec.lastID, "req-1")
+	}
+	if rec.lastResult.Behavior != "allow" {
+		t.Fatalf("RespondPermission behavior = %q, want %q", rec.lastResult.Behavior, "allow")
+	}
+}
+
 // ──────────────────────────────────────────────────────────────
 // Session routing / cleanup CAS tests
 // ──────────────────────────────────────────────────────────────
@@ -8377,6 +8505,167 @@ func TestProcessInteractiveEvents_QueuedMessageUsesItsOwnReplyCtx(t *testing.T) 
 		case "response2":
 			if ev.replyCtx != "ctx-turn2" {
 				t.Errorf("turn2 reply used replyCtx=%v, want ctx-turn2 (regression: msg2's reply quoted msg1)", ev.replyCtx)
+			}
+		}
+	}
+}
+
+// TestIssue814_QueuedMessageAfterCleanEventResult_UsesOwnReplyCtx is a
+// regression test for issue #814 ("Bot replies with the previous
+// message's answer instead of the current one"). The reported symptom is
+// that when the user sends message B immediately after message A, the
+// bot's reply to B carries A's reply context (and therefore quotes
+// A's bubble instead of B's), even though the response text is for B.
+//
+// The existing TestProcessInteractiveEvents_QueuedMessageUsesItsOwnReplyCtx
+// pins the "queue drain INSIDE processInteractiveEvents" path. This
+// new test pins the equivalent invariant for the OUTER drain path
+// driven from ReceiveMessage / handleMessage, which is what real users
+// hit: A's foreground turn is in processInteractiveEvents; B arrives
+// via ReceiveMessage while the session is locked; A finishes; the
+// foreground goroutine calls drainPendingMessages; B is processed
+// inside that drain loop. If anything along that path leaks A's
+// replyCtx into B's reply (or vice versa), the assertions at the
+// bottom of this test will fail.
+//
+// Unlike the inner-drain test, this one goes through the full
+// ReceiveMessage → handleMessage → processInteractiveMessageWith →
+// processInteractiveEvents → drainPendingMessages pipeline so any
+// state-handling bug at any layer surfaces.
+func TestIssue814_QueuedMessageAfterCleanEventResult_UsesOwnReplyCtx(t *testing.T) {
+	p := &replyCtxRecordingPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	sess := newQueuingSession("qs-814")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user-814"
+
+	// Wait until B has been queued (state.pendingMessages grows), then
+	// release A's turn. This guarantees the test exercises the exact
+	// ordering the bug report describes: A is mid-flight, B arrives and
+	// is queued behind A, A's response is sent, the drain loop picks
+	// up B and runs its own turn. Without this signal, the agent's
+	// events would be produced faster than the test goroutine can
+	// dispatch B, and the test would degenerate into "two independent
+	// sequential turns" — which is not the bug's path.
+	turnAEmitted := make(chan struct{})
+
+	// Producer goroutine: A's events are held back until the engine
+	// shows B sitting in the queue; B's events are then produced after
+	// A's turn is recorded as complete.
+	go func() {
+		// Turn 1 (A) — wait for Send call.
+		sess.sendMu.Lock()
+		for len(sess.sendCalls) < 1 {
+			sess.sendMu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			sess.sendMu.Lock()
+		}
+		sess.sendMu.Unlock()
+
+		// Wait until B has been queued behind A. Poll the engine's
+		// interactive state directly; this is the same state that
+		// handleMessage updated when it called queueMessageForBusySession.
+		for {
+			e.interactiveMu.Lock()
+			st, ok := e.interactiveStates[key]
+			e.interactiveMu.Unlock()
+			if ok && st != nil {
+				st.mu.Lock()
+				n := len(st.pendingMessages)
+				st.mu.Unlock()
+				if n >= 1 {
+					break
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		// A's events — emitted only after we are confident B is queued.
+		sess.events <- Event{Type: EventText, Content: "response-A"}
+		sess.events <- Event{Type: EventResult, Content: "response-A", Done: true}
+		close(turnAEmitted)
+
+		// Turn 2 (B) — only after the engine has called Send for B.
+		sess.sendMu.Lock()
+		for len(sess.sendCalls) < 2 {
+			sess.sendMu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			sess.sendMu.Lock()
+		}
+		sess.sendMu.Unlock()
+		sess.events <- Event{Type: EventText, Content: "response-B"}
+		sess.events <- Event{Type: EventResult, Content: "response-B", Done: true}
+	}()
+
+	// A: must reach the foreground turn (not be queued behind a stale
+	// state). We launch it first; the producer above gates A's events
+	// on B being queued, so A's processing will block on the engine
+	// event loop until the test sends B.
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key,
+		Platform:   "test",
+		UserID:     "u-814",
+		UserName:   "user814",
+		MessageID:  "msg-A",
+		Content:    "what is the answer to A?",
+		ReplyCtx:   "ctx-A",
+	})
+
+	// Give A's foreground goroutine time to enter the event loop and
+	// the session lock to settle, then dispatch B. B will arrive while
+	// A is in the event loop awaiting events — exactly the timing the
+	// bug report describes.
+	time.Sleep(50 * time.Millisecond)
+	e.ReceiveMessage(p, &Message{
+		SessionKey: key,
+		Platform:   "test",
+		UserID:     "u-814",
+		UserName:   "user814",
+		MessageID:  "msg-B",
+		Content:    "what is the answer to B?",
+		ReplyCtx:   "ctx-B",
+	})
+
+	// Wait for both replies to be recorded. The producer gates B's
+	// events on A being complete, so we will see A's reply first,
+	// then B's.
+	deadline := time.After(5 * time.Second)
+	for {
+		evs := p.recordedEvents()
+		var sawA, sawB bool
+		for _, ev := range evs {
+			if ev.content == "response-A" {
+				sawA = true
+			}
+			if ev.content == "response-B" {
+				sawB = true
+			}
+		}
+		if sawA && sawB {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for both replies; recorded=%v", p.recordedEvents())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// The invariant: each turn's response text must be delivered with
+	// that turn's replyCtx. If a race leaks A's replyCtx into B's reply
+	// (or vice versa) — the symptom in #814 — the assertions below
+	// fire.
+	for _, ev := range p.recordedEvents() {
+		switch ev.content {
+		case "response-A":
+			if ev.replyCtx != "ctx-A" {
+				t.Errorf("turn-A reply used replyCtx=%v, want ctx-A", ev.replyCtx)
+			}
+		case "response-B":
+			if ev.replyCtx != "ctx-B" {
+				t.Errorf("turn-B reply used replyCtx=%v, want ctx-B (regression for #814: msg-B's reply quoted msg-A)", ev.replyCtx)
 			}
 		}
 	}
@@ -12887,7 +13176,7 @@ func TestUnsolicitedReader_RelaysEventResult(t *testing.T) {
 	defer e.stopUnsolicitedReader(state)
 
 	// Send only EventResult (no EventText) to ensure the reader uses EventResult.Content.
-	sess.events <- Event{Type: EventResult, Content: "All 5 campaigns created successfully"}
+	sess.events <- Event{Type: EventResult, Content: "All 5 campaigns created successfully", Done: true}
 
 	sent := waitForPlatformSend(p, 1, 5*time.Second)
 	if len(sent) == 0 {
@@ -13172,7 +13461,7 @@ func TestEventsNeedResync_ClearedOnCleanResult(t *testing.T) {
 
 	// Send EventResult to trigger clean exit.
 	go func() {
-		sess.events <- Event{Type: EventResult, Content: "done"}
+		sess.events <- Event{Type: EventResult, Content: "done", Done: true}
 	}()
 
 	sendDone := make(chan error, 1)

@@ -2993,10 +2993,34 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 	if iKey == "" {
 		iKey = e.interactiveKeyForSessionKey(msg.SessionKey)
 	}
-	e.interactiveMu.Lock()
-	state, ok := e.interactiveStates[iKey]
-	e.interactiveMu.Unlock()
-	if !ok || state == nil {
+
+	state, pending := e.lookupPending(iKey)
+
+	if state == nil || pending == nil {
+		// Fallback: cron new-per-run sessions use composite keys like
+		// "key#cron:sid" which won't match the plain sessionKey from
+		// platform permission button callbacks.
+		e.interactiveMu.Lock()
+		prefix := iKey + "#cron:"
+		var cronKeys []string
+		for k := range e.interactiveStates {
+			if strings.HasPrefix(k, prefix) {
+				cronKeys = append(cronKeys, k)
+			}
+		}
+		e.interactiveMu.Unlock()
+		// If multiple cron runs coexist for the same session, pick
+		// the first with a pending permission. In practice only one
+		// cron run per session should be in the pending state at a
+		// time, so this loop is bounded and deterministic for the
+		// expected case.
+		for _, k := range cronKeys {
+			state, pending = e.lookupPending(k)
+			if state != nil && pending != nil {
+				goto found
+			}
+		}
+
 		// Stale platform-callback permission click (e.g. user tapped an old
 		// "Allow"/"Deny" button after the session was reset, the bot was
 		// restarted, or the card message ID was redelivered). Drop silently so
@@ -3011,18 +3035,7 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 		}
 		return false
 	}
-
-	state.mu.Lock()
-	pending := state.pending
-	state.mu.Unlock()
-	if pending == nil {
-		if msg.IsPermissionResponse {
-			slog.Debug("dropping stale permission callback (no pending request)",
-				"session", msg.SessionKey, "content", content)
-			return true
-		}
-		return false
-	}
+found:
 
 	// AskUserQuestion: interpret user response as an answer, not a permission decision
 	if len(pending.Questions) > 0 {
@@ -3116,6 +3129,22 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 	pending.resolve()
 
 	return true
+}
+
+// lookupPending returns the interactive state and its pending permission for
+// the given key, or nil/nil if the state is absent or has no pending. Caller
+// must NOT hold interactiveMu.
+func (e *Engine) lookupPending(iKey string) (*interactiveState, *pendingPermission) {
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[iKey]
+	e.interactiveMu.Unlock()
+	if state == nil {
+		return nil, nil
+	}
+	state.mu.Lock()
+	pending := state.pending
+	state.mu.Unlock()
+	return state, pending
 }
 
 // resolveAskQuestionAnswer converts user input into answer text.
@@ -3526,10 +3555,8 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 	// already decorated. See cc-connect#496 and the cc-connect/core/runas.go
 	// preamble for why run_as_user has to survive this copy.
 	if _, ok := opts["run_as_user"]; !ok {
-		if ma, ok := e.agent.(interface{ GetRunAsUser() string }); ok {
-			if u := ma.GetRunAsUser(); u != "" {
-				opts["run_as_user"] = u
-			}
+		if u := e.runAsUser(); u != "" {
+			opts["run_as_user"] = u
 		}
 	}
 	if _, ok := opts["run_as_env"]; !ok {
@@ -4973,6 +5000,21 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventResult:
+			// Non-terminal result events (e.g. mid-turn compaction: Claude
+			// Code's auto-context-compact emits type:"result" with
+			// subtype:"compact"/"compaction" and Done=false) must not trigger
+			// turn-completion side effects. Skip them so the outer loop
+			// continues to read subsequent tool calls and assistant messages
+			// for the same turn. See PR #1272 / issue #481.
+			if !event.Done {
+				slog.Debug("EventResult: non-terminal result event, continuing event loop",
+					"session", session.ID,
+					"input_tokens", event.InputTokens,
+					"output_tokens", event.OutputTokens,
+					"metadata", event.Metadata,
+				)
+				continue
+			}
 			cp.Finalize(ProgressCardStateCompleted)
 			// Use state.agentSession.CurrentSessionID() instead of event.SessionID.
 			// event.SessionID may be empty in some cases, causing the agent_session_id
@@ -15456,7 +15498,28 @@ func (e *Engine) lookupEffectiveWorkspaceBinding(channelKey string) (*WorkspaceB
 		return nil, "", false
 	}
 
+	// When run_as_user isolation is active, the workspace lives in the target
+	// user's space (typically under their HOME, set to mode 0700 by `sudo -i`).
+	// The supervisor process runs as a different user, so os.Stat here would
+	// hit EACCES on the target user's private path and we'd wrongly conclude
+	// the directory is "missing" — then Unbind() it, permanently dropping a
+	// perfectly valid binding. The agent that actually uses the workspace runs
+	// as the target user and can access it fine, so skip the supervisor-side
+	// existence check entirely under isolation and trust the binding.
+	if e.runAsUser() != "" {
+		return b, bindingKey, true
+	}
+
 	if _, err := os.Stat(b.Workspace); err != nil {
+		// Only a genuine "does not exist" justifies dropping the binding. A
+		// permission error (or any other transient stat failure) must NOT
+		// unbind: the directory may well exist but be inaccessible to the
+		// supervisor. Treating those as "missing" silently loses user bindings.
+		if !os.IsNotExist(err) {
+			slog.Warn("bound workspace stat failed; keeping binding (not treating as missing)",
+				"workspace", b.Workspace, "channel_key", channelKey, "binding_scope", bindingKey, "err", err)
+			return b, bindingKey, true
+		}
 		slog.Warn("bound workspace directory missing",
 			"workspace", b.Workspace, "channel_key", channelKey, "binding_scope", bindingKey)
 		if bindingKey != sharedWorkspaceBindingsKey {
@@ -15466,6 +15529,16 @@ func (e *Engine) lookupEffectiveWorkspaceBinding(channelKey string) (*WorkspaceB
 	}
 
 	return b, bindingKey, true
+}
+
+// runAsUser returns the configured run_as_user for the engine's agent, or ""
+// if OS-level user isolation is not active. Mirrors the capability probe used
+// when copying isolation settings to per-workspace agents (getOrCreateWorkspaceAgent).
+func (e *Engine) runAsUser() string {
+	if ma, ok := e.agent.(interface{ GetRunAsUser() string }); ok {
+		return ma.GetRunAsUser()
+	}
+	return ""
 }
 
 // resolveWorkspace resolves a channel to a workspace directory.
