@@ -5,7 +5,7 @@ description: Build, run, stop, and debug the cc-connect Go binary locally. Use w
 
 # cc-connect Local Dev / Build / Run / Stop
 
-Project-specific commands for developing and debugging cc-connect. All commands run from the repo root (`/apsara/workspace/cc-connect`). Go 1.25+ and Node (for the web UI) required.
+Project-specific commands for developing and debugging cc-connect. All commands run from the cc-connect repository root. Go 1.25+ and Node (for the web UI) required.
 
 ## ⚠️ Always build WITH web / 必须带 Web 启动
 
@@ -22,7 +22,6 @@ A `no_web` binary still serves Management **API** (`/api/v1/*`) but **not** the 
 **Standard deploy pipeline (sync, rebuild, restart):**
 
 ```bash
-cd /apsara/workspace/cc-connect
 make build                    # npm run build + go embed web/dist
 scripts/ccctl.sh restart      # detached restart; do NOT kill from inside cc-connect
 ```
