@@ -4969,11 +4969,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When thinking messages are hidden, behavior depends on display mode:
 			//   quiet:   append separator to keep all text in one card
 			//   compact: freeze+detach to split text into separate cards
+			// Streaming card already aggregates the turn — do not also flush
+			// preceding text as plain messages (DingTalk AI card + narration leak).
 			if !e.display.ThinkingMessages && len(textParts) > segmentStart {
-				if e.display.Mode == "quiet" {
+				if streamCard != nil && !streamCard.Failed() {
+					segmentStart = len(textParts)
+					silentHold = false
+				} else if e.display.Mode == "quiet" {
 					if sp.canPreview() && sp.appendSeparator("\n\n") {
 						textParts = append(textParts, "\n\n")
 					}
+					silentHold = false
 				} else {
 					if sp.canPreview() {
 						sp.freeze()
@@ -4987,8 +4993,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						}
 					}
 					segmentStart = len(textParts)
+					silentHold = false
 				}
-				silentHold = false
 			}
 			if e.display.ThinkingMessages && event.Content != "" {
 				// --- StreamingCard path ---
@@ -5056,11 +5062,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When tool messages are hidden, behavior depends on display mode:
 			//   quiet:   append separator to keep all text in one card
 			//   compact: freeze+detach to split text into separate cards
+			// Streaming card already aggregates the turn — do not also flush
+			// preceding text as plain messages (DingTalk AI card + narration leak).
 			if !e.display.ToolMessages && len(textParts) > segmentStart {
-				if e.display.Mode == "quiet" {
+				if streamCard != nil && !streamCard.Failed() {
+					segmentStart = len(textParts)
+					silentHold = false
+				} else if e.display.Mode == "quiet" {
 					if sp.canPreview() && sp.appendSeparator("\n\n") {
 						textParts = append(textParts, "\n\n")
 					}
+					silentHold = false
 				} else {
 					if sp.canPreview() {
 						sp.freeze()
@@ -5074,8 +5086,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						}
 					}
 					segmentStart = len(textParts)
+					silentHold = false
 				}
-				silentHold = false
 			}
 			if e.display.ToolMessages {
 				// --- StreamingCard path ---

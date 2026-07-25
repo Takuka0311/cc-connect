@@ -15900,3 +15900,59 @@ func TestProcessInteractiveEvents_StreamingCard_BareNoReply_Suppressed(t *testin
 		t.Fatalf("silent reply leaked NO_REPLY into the streaming card: %q", card.finalContent())
 	}
 }
+
+// TestProcessInteractiveEvents_StreamingCard_NoPlainNarrationWhenHidden is a
+// regression for DingTalk AI-card turns with thinking_messages/tool_messages
+// disabled: each agent narration segment before a tool/thinking event was also
+// flushed as a plain Reply, so users saw the AI card PLUS one ordinary message
+// per "thinking out loud" sentence. Streaming card must be the sole delivery.
+func TestProcessInteractiveEvents_StreamingCard_NoPlainNarrationWhenHidden(t *testing.T) {
+	card := &recordingStreamCard{}
+	p := &recordingStreamCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "dingtalk"},
+		card:               card,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{
+		Mode:             "full",
+		ThinkingMessages: false,
+		ToolMessages:     false,
+		ThinkingMaxLen:   300,
+		ToolMaxLen:       500,
+	})
+	sessionKey := "dingtalk:g:streamcard-no-plain-narration"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-streamcard-no-plain")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-streamcard-no-plain",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventText, Content: "让我从源码确认这两个参数是否支持热加载。"}
+	agentSession.events <- Event{Type: EventThinking, Content: "planning next tool"}
+	agentSession.events <- Event{Type: EventText, Content: "接着查一下调用点。"}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "rg hot_reload"}
+	agentSession.events <- Event{Type: EventText, Content: "结论：支持热加载。"}
+	agentSession.events <- Event{Type: EventResult, Content: "结论：支持热加载。", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-streamcard-no-plain", time.Now(), nil, nil, state.replyCtx)
+
+	if !card.finalized() {
+		t.Fatalf("expected streaming card to be finalized")
+	}
+	sent := p.getSent()
+	for _, msg := range sent {
+		if strings.Contains(msg, "让我从源码确认") ||
+			strings.Contains(msg, "接着查一下调用点") ||
+			strings.Contains(msg, "planning next tool") ||
+			strings.Contains(msg, "🔧") {
+			t.Fatalf("streaming-card turn leaked plain narration/tool message: %q (all sent=%v)", msg, sent)
+		}
+	}
+	final := card.finalContent()
+	if !strings.Contains(final, "结论：支持热加载。") {
+		t.Fatalf("streaming card final content missing answer, got %q", final)
+	}
+}
