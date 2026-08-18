@@ -152,3 +152,12 @@ credentials/
 
 .codex
 cc-connect-new
+
+# ============================================================================
+# Local-only (not synced upstream)
+# ============================================================================
+# Session-state artifacts left behind by core tests
+core/test_ws_*.json
+# Locally authored skills — keep out of the fork's history
+.claude/skills/remote-ide-server-crash/
+*-skill-*.tar.gz
